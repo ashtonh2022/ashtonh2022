@@ -1,6 +1,6 @@
 - 👋 Hi, I’m @ashtonh2022
-- 👀 I’m interested in Artificial Intelligence
-- 🌱 I’m currently learning Java at University
+- 👀 I’m interested in Data Engineering and Software Engineering
+- 🌱 I’m currently learning Java, SQL, Javascript at University
 - 💞️ I’m looking to collaborate on any open source collaborative projects
 - 📫 How to reach me at my email ashton.hull2022@gmail.com or my phone number 210 393 2169
 - 😄 Pronouns: He/Him
