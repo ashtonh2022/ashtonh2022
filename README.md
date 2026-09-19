@@ -1,12 +1,59 @@
-- 👋 Hi, I’m @ashtonh2022
-- 👀 I’m interested in Data Engineering and Software Engineering
-- 🌱 I’m currently learning Java, SQL, Javascript at University
-- 💞️ I’m looking to collaborate on any open source collaborative projects
-- 📫 How to reach me at my email ashton.hull2022@gmail.com or my phone number 210 393 2169
-- 😄 Pronouns: He/Him
-- ⚡ Fun fact: ...
+# Landlord
 
-<!---
-ashtonh2022/ashtonh2022 is a ✨ special ✨ repository because its `README.md` (this file) appears on your GitHub profile.
-You can click the Preview link to take a look at your changes.
---->
+A web version of Dou Dizhu ("Fight the Landlord") for English speakers. Create a room, share the link, and play with friends in the browser. Empty seats can be filled with bots.
+
+- 3-player (one deck) and 4-player (two decks) modes
+- Call/rob or 1-2-3 bidding, optional doubling round, optional kitty bonus, adjustable kitty size and turn timer
+- Hints, highlighted playable cards, named combinations and a built-in rules page so new players can start right away
+- Reconnect to your seat after a refresh or a dropped connection; a bot covers for you until you are back
+- One server process hosts everything; the rules engine is a pure TypeScript package shared by server and client, ready for mobile and desktop wrappers later
+
+Rules: [docs/RULES.md](docs/RULES.md). Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Deploying: [docs/DEPLOY.md](docs/DEPLOY.md).
+
+## Quick start
+
+Requires Node 22 and pnpm 10 (`corepack enable` gives you pnpm).
+
+```bash
+pnpm install
+pnpm dev        # client on http://localhost:5173, server on :8080
+```
+
+Production build and run:
+
+```bash
+pnpm build
+pnpm start      # http://localhost:8080
+```
+
+## Scripts
+
+| Command | What it does |
+|---|---|
+| `pnpm dev` | Runs the Vite dev server and the game server with hot reload |
+| `pnpm build` | Builds the client, then bundles the server into `apps/server/dist` |
+| `pnpm start` | Runs the built server (serves the client too) |
+| `pnpm test` | Unit tests for every package (vitest) |
+| `pnpm typecheck` | `tsc --noEmit` for every package |
+| `pnpm e2e` | Playwright end-to-end tests in Chromium |
+| `pnpm format` | Prettier |
+
+## Layout
+
+```
+packages/engine     rules, state machine, bot, hints (pure TS, no dependencies)
+packages/protocol   WebSocket message schemas (zod) and view types
+apps/server         game server: rooms, seats, timers, bots, static hosting
+apps/web            React client
+docs/               rules, architecture, deployment
+e2e/                Playwright tests
+```
+
+## Sounds
+
+`apps/web/public/audio/` contains silent placeholders. Drop in real files with the same names to enable sounds (see the README in that folder).
+
+## Roadmap
+
+- Mobile apps (Capacitor wrapper around `apps/web`)
+- Desktop / Steam (Electron or Tauri wrapper, local single-player against bots)
