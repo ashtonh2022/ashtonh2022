@@ -117,10 +117,7 @@ export interface Combo {
 export type Phase = 'bidding' | 'doubling' | 'playing' | 'finished' | 'redeal';
 
 export type BidAction =
-  | { type: 'call' }
-  | { type: 'rob' }
-  | { type: 'pass_bid' }
-  | { type: 'bid'; value: 1 | 2 | 3 };
+  { type: 'call' } | { type: 'rob' } | { type: 'pass_bid' } | { type: 'bid'; value: 1 | 2 | 3 };
 
 export type HandAction =
   | BidAction
