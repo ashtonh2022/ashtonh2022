@@ -720,3 +720,112 @@ describe('random legal playouts', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// EXPLORATION (temporary)
+// ---------------------------------------------------------------------------
+
+import { key } from '../test-helpers';
+
+function pickSubset(hand: Card[], rng: () => number): Card[] {
+  const size = 1 + Math.floor(rng() * Math.min(hand.length, 8));
+  const pool = hand.slice();
+  const out: Card[] = [];
+  for (let i = 0; i < size; i++) {
+    const index = Math.floor(rng() * pool.length);
+    out.push(...pool.splice(index, 1));
+  }
+  return out;
+}
+
+function checkPlayingState(state: HandState, rng: () => number, label: string): void {
+  const seat = state.turn;
+  const current = state.trick.current;
+  const plays = findPlays(hand(state, seat), current, state.rules);
+  const keys = new Set(plays.map((combo) => key(combo.cards)));
+  for (const combo of plays) {
+    const result = applyAction(state, seat, { type: 'play', cardIds: ids(combo.cards) });
+    if (!result.ok) throw new Error(`${label}: listed play rejected ${result.code} ${key(combo.cards)}`);
+  }
+  for (let i = 0; i < 6; i++) {
+    const subset = pickSubset(hand(state, seat), rng);
+    const result = applyAction(state, seat, { type: 'play', cardIds: ids(subset) });
+    const listed = keys.has(key(subset));
+    if (result.ok !== listed) {
+      throw new Error(
+        `${label}: subset ${key(subset)} listed=${listed} ok=${result.ok} ${result.ok ? '' : result.code} current=${current ? `${current.type}/${current.rank}/${current.length}` : 'lead'}`,
+      );
+    }
+    if (!result.ok && result.code !== 'invalid_combo' && result.code !== 'does_not_beat') {
+      throw new Error(`${label}: unexpected code ${result.code}`);
+    }
+  }
+  for (let other = 0; other < state.rules.playerCount; other++) {
+    if (other === seat) continue;
+    expect(rejection(applyAction(state, other, PASS))).toBe('not_your_turn');
+    const first = hand(state, other)[0] as Card;
+    expect(rejection(applyAction(state, other, { type: 'play', cardIds: [first.id] }))).toBe(
+      'not_your_turn',
+    );
+  }
+  if (current === null) {
+    expect(rejection(applyAction(state, seat, PASS))).toBe('cannot_pass');
+  }
+}
+
+function explore(seed: string, rules: RuleSettings): HandState {
+  const rng = seededRng(seed);
+  const firstBidder = Math.floor(rng() * rules.playerCount);
+  let state = createHand({ rules, seed, handNumber: 1, firstBidder });
+  let trickWins = 0;
+  for (let steps = 0; state.phase !== 'finished'; steps++) {
+    if (steps > 1500) throw new Error(`${seed} did not finish`);
+    if (state.phase === 'redeal') return state;
+    for (const viewer of [...state.hands.keys(), null]) expectNoLeak(state, viewer);
+    for (const seat of actingSeats(state)) {
+      expect(applyAction(state, seat, timeoutAction(state, seat)).ok).toBe(true);
+    }
+    if (state.phase === 'playing') checkPlayingState(state, rng, `${seed}#${steps}`);
+    for (const seat of actingSeats(state)) {
+      const result = applyAction(state, seat, randomAction(state, seat, rng));
+      if (!result.ok) throw new Error(`${seed}: ${result.code} ${result.error}`);
+      for (const event of result.events) {
+        if (event.type === 'trick_won') {
+          trickWins++;
+          expect(result.state.turn).toBe(event.seat);
+          expect(result.state.trick).toEqual({ leader: event.seat, plays: [], current: null, currentSeat: null });
+        }
+        if (event.type === 'hand_finished') expect(event.result).toEqual(result.state.result);
+      }
+      state = result.state;
+      if (state.phase === 'finished') break;
+    }
+  }
+  const tricks = new Set(state.history.map((entry) => entry.trickNumber)).size;
+  expect(trickWins).toBe(tricks - 1);
+  return state;
+}
+
+describe('EXPLORATION', () => {
+  it('sweep', () => {
+    const variants: RuleSettings[] = [
+      RULES_3P,
+      { ...RULES_3P, kittySize: 12, chainsThroughTwos: false },
+      { ...RULES_3P, kittySize: 9, biddingMode: 'points', doublingRound: true, kittyBonus: true },
+      { ...RULES_3P, kittySize: 6, kittyBonus: true, allPass: 'redeal' },
+      RULES_4P,
+      { ...RULES_4P, kittySize: 16, chainsThroughTwos: false, kittyBonus: true },
+      { ...RULES_4P, kittySize: 4, biddingMode: 'points', doublingRound: true },
+      { ...RULES_4P, kittySize: 12, allPass: 'redeal', kittyBonus: true },
+    ];
+    let finished = 0;
+    for (let i = 0; i < 160; i++) {
+      const state = explore(`explore-${i}`, variants[i % variants.length] as RuleSettings);
+      if (state.phase === 'finished') {
+        checkFinished(state);
+        finished++;
+      }
+    }
+    expect(finished).toBeGreaterThan(100);
+  }, 300000);
+});
