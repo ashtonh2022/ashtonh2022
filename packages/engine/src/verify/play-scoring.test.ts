@@ -16,10 +16,11 @@ import {
   RULES_3P,
   RULES_4P,
   cards,
+  dealSpecs,
+  key,
   play,
   playingState,
   rejection,
-  run,
   step,
 } from '../test-helpers';
 
@@ -47,6 +48,32 @@ function sum(values: readonly number[]): number {
   return values.reduce((total, value) => total + value, 0);
 }
 
+const ACTIONS: Record<string, HandAction> = {
+  P: PASS,
+  C: CALL,
+  R: { type: 'rob' },
+  PB: PASS_BID,
+  D1: { type: 'double', double: true },
+  D0: { type: 'double', double: false },
+};
+
+/**
+ * Applies a '0:3 3|1:P|2:PB' script of seat:move pairs, every move being cards from that seat's
+ * current hand, or P (pass), C (call), R (rob), PB (pass the bid), D1 / D0 (double / keep).
+ */
+function script(start: HandState, moves: string): { state: HandState; events: HandEvent[] } {
+  let state = start;
+  const events: HandEvent[] = [];
+  for (const move of moves.split('|')) {
+    const [seat, spec] = move.trim().split(':') as [string, string];
+    const at = Number(seat);
+    const next = step(state, at, ACTIONS[spec] ?? play(spec, hand(state, at)));
+    state = next.state;
+    events.push(...next.events);
+  }
+  return { state, events };
+}
+
 interface SettleOptions {
   rules?: RuleSettings;
   /** One spec per seat, '' for the seat that went out. */
@@ -64,12 +91,8 @@ interface SettleOptions {
 /** A hand-built finished position, settled. */
 function settled(opts: SettleOptions): HandResult {
   const kitty = typeof opts.kitty === 'string' ? opts.kitty : undefined;
-  const base = playingState({
-    rules: opts.rules,
-    hands: opts.hands,
-    landlord: opts.landlord,
-    kitty,
-  });
+  const { rules, hands, landlord } = opts;
+  const base = playingState({ rules, hands, landlord, kitty });
   return settle({
     ...base,
     kitty: Array.isArray(opts.kitty) ? opts.kitty : base.kitty,
@@ -88,11 +111,7 @@ function settled(opts: SettleOptions): HandResult {
 describe('trick play legality', () => {
   it('the landlord leads the first trick and cannot pass', () => {
     const dealt = createHand({ rules: RULES_3P, seed: 'lead', handNumber: 1, firstBidder: 1 });
-    const { state } = run(dealt, [
-      [1, CALL],
-      [2, PASS_BID],
-      [0, PASS_BID],
-    ]);
+    const { state } = script(dealt, '1:C|2:PB|0:PB');
     expect(state).toMatchObject({ phase: 'playing', landlord: 1, turn: 1 });
     expect(state.trick.leader).toBe(1);
     expect(rejection(applyAction(state, 1, PASS))).toBe('cannot_pass');
@@ -102,10 +121,8 @@ describe('trick play legality', () => {
   });
 
   it('an answer needs the same type and length with a higher rank, or a bomb or rocket', () => {
-    const start = playingState({
-      hands: ['7 7 8 9 10 J Q', '3 5 7 7 9 9 K', '4 4 4 4 BJ RJ 6'],
-      landlord: 0,
-    });
+    const hands = ['7 7 8 9 10 J Q', '3 5 7 7 9 9 K', '4 4 4 4 BJ RJ 6'];
+    const start = playingState({ hands, landlord: 0 });
     const led = step(start, 0, play('7', hand(start, 0))).state;
     for (const spec of ['3', '7', '9 9', '7 7']) {
       expect(rejection(applyAction(led, 1, play(spec, hand(led, 1))))).toBe('does_not_beat');
@@ -143,12 +160,7 @@ describe('trick play legality', () => {
 describe('trick resolution', () => {
   it('3 players: only passes after the current play count; the last player to play leads', () => {
     const start = playingState({ hands: ['3 K 2', '4 5 6', '7 8 9'], landlord: 0 });
-    const first = run(start, [
-      [0, play('3', hand(start, 0))],
-      [1, PASS],
-      [2, play('7', hand(start, 2))],
-      [0, PASS],
-    ]);
+    const first = script(start, '0:3|1:P|2:7|0:P');
     expect(types(first.events)).toEqual(['play', 'pass', 'play', 'pass']);
     expect(first.state.turn).toBe(1);
     const won = step(first.state, 1, PASS);
@@ -162,23 +174,10 @@ describe('trick resolution', () => {
 
   it('4 players: needs three passes after the current play; a passed seat may play again', () => {
     const four = playingState({ hands: ['3 K 2', '4 9 J', '7 8 Q', '5 6 10'], landlord: 0 });
-    const partial = run(four, [
-      [0, play('3', hand(four, 0))],
-      [1, PASS],
-      [2, play('7', hand(four, 2))],
-      [3, PASS],
-      [0, PASS],
-    ]);
+    const partial = script(four, '0:3|1:P|2:7|3:P|0:P');
     expect(types(partial.events)).not.toContain('trick_won');
     expect(partial.state.turn).toBe(1);
-    const again = run(partial.state, [
-      [1, play('9', hand(four, 1))], // seat 1 passed earlier in this trick
-      [2, PASS],
-      [3, play('10', hand(four, 3))],
-      [0, PASS],
-      [1, PASS],
-      [2, PASS],
-    ]);
+    const again = script(partial.state, '1:9|2:P|3:10|0:P|1:P|2:P');
     expect(again.events[again.events.length - 1]).toEqual({ type: 'trick_won', seat: 3 });
     expect(again.state.turn).toBe(3);
     expect(again.state.trick.leader).toBe(3);
@@ -188,23 +187,23 @@ describe('trick resolution', () => {
 
   it('trick numbers advance by one per trick and the ending pass belongs to the trick it ended', () => {
     const start = playingState({ hands: ['3 4 K 2', '5 9 J A', '7 8 Q 10'], landlord: 0 });
-    const { state } = run(start, [
-      [0, play('3', hand(start, 0))],
-      [1, play('5', hand(start, 1))],
-      [2, PASS],
-      [0, PASS],
-      [1, play('9', hand(start, 1))],
-      [2, play('10', hand(start, 2))],
-      [0, play('K', hand(start, 0))],
-      [1, PASS],
-      [2, PASS],
-      [0, play('4', hand(start, 0))],
-    ]);
+    const { state } = script(start, '0:3|1:5|2:P|0:P|1:9|2:10|0:K|1:P|2:P|0:4');
     expect(state.history.map((entry) => entry.trickNumber)).toEqual([1, 1, 1, 1, 2, 2, 2, 2, 2, 3]);
     expect(state.history.map((entry) => entry.seat)).toEqual([0, 1, 2, 0, 1, 2, 0, 1, 2, 0]);
     expect(state.trick).toMatchObject({ leader: 0, currentSeat: 0 });
     expect(state.trick.plays).toHaveLength(1);
     expect(state.playCounts).toEqual([3, 2, 1]);
+  });
+
+  it('3 players: a seat that passed may play again when the trick comes back to it', () => {
+    const start = playingState({ hands: ['3 K 2', '4 9 J', '7 8 Q'], landlord: 0 });
+    const back = script(start, '0:3|1:P|2:7|0:P').state;
+    expect(back.turn).toBe(1);
+    expect(legalActions(back, 1)).toMatchObject({ canPlay: true, canPass: true });
+    const { state, events } = script(back, '1:9|2:P|0:P');
+    expect(types(events)).toEqual(['play', 'pass', 'pass', 'trick_won']);
+    expect(state).toMatchObject({ turn: 1, playCounts: [1, 1, 1] });
+    expect(state.trick.leader).toBe(1);
   });
 });
 
@@ -215,21 +214,12 @@ describe('trick resolution', () => {
 describe('end of hand', () => {
   it('ends the moment a peasant plays their last cards mid-trick (anti-spring, 3 players)', () => {
     const start = playingState({ hands: ['3 K', '9', '7 8'], landlord: 0, kitty: '5 6 J' });
-    const { state, events } = run(start, [
-      [0, play('3', hand(start, 0))],
-      [1, play('9', hand(start, 1))],
-    ]);
+    const { state, events } = script(start, '0:3|1:9');
     expect(types(events)).toEqual(['play', 'play', 'hand_finished']);
     expect(state).toMatchObject({ phase: 'finished', turn: -1, playCounts: [1, 1, 0] });
     expect(state.hands[1]).toEqual([]);
-    expect(state.result).toMatchObject({
-      winnerSide: 'peasants',
-      winnerSeat: 1,
-      landlord: 0,
-      spring: 'anti_spring',
-      stake: 2,
-      amounts: [-4, 2, 2],
-    });
+    expect(state.result).toMatchObject({ winnerSide: 'peasants', winnerSeat: 1, landlord: 0 });
+    expect(state.result).toMatchObject({ spring: 'anti_spring', stake: 2, amounts: [-4, 2, 2] });
     expect(state.result).toEqual(settle(state));
     expect(rejection(applyAction(state, 2, PASS))).toBe('wrong_phase');
     expect(rejection(applyAction(state, 0, play('K', hand(state, 0))))).toBe('wrong_phase');
@@ -238,58 +228,24 @@ describe('end of hand', () => {
 
   it('is not an anti-spring once the landlord has played more than the opening lead', () => {
     const start = playingState({ hands: ['3 4 K 2', '5 9', '7 8'], landlord: 0 });
-    const { state } = run(start, [
-      [0, play('3', hand(start, 0))],
-      [1, play('5', hand(start, 1))],
-      [2, PASS],
-      [0, play('K', hand(start, 0))],
-      [1, PASS],
-      [2, PASS],
-      [0, play('4', hand(start, 0))],
-      [1, play('9', hand(start, 1))],
-    ]);
+    const { state } = script(start, '0:3|1:5|2:P|0:K|1:P|2:P|0:4|1:9');
     expect(state).toMatchObject({ phase: 'finished', playCounts: [3, 2, 0] });
     expect(state.result).toMatchObject({ spring: null, stake: 1, amounts: [-2, 1, 1] });
   });
 
   it('4 players: spring when the landlord wins and no peasant ever played', () => {
     const start = playingState({ hands: ['3 3 K', '4 5 6', '7 8 9', '10 J Q'], landlord: 0 });
-    const { state, events } = run(start, [
-      [0, play('3 3', hand(start, 0))],
-      [1, PASS],
-      [2, PASS],
-      [3, PASS],
-      [0, play('K', hand(start, 0))],
-    ]);
-    expect(types(events)).toEqual([
-      'play',
-      'pass',
-      'pass',
-      'pass',
-      'trick_won',
-      'play',
-      'hand_finished',
-    ]);
+    const { state, events } = script(start, '0:3 3|1:P|2:P|3:P|0:K');
+    expect(types(events).join(' ')).toBe('play pass pass pass trick_won play hand_finished');
     expect(state.playCounts).toEqual([2, 0, 0, 0]);
-    expect(state.result).toMatchObject({
-      winnerSide: 'landlord',
-      spring: 'spring',
-      stake: 2,
-      amounts: [6, -2, -2, -2],
-    });
+    expect(state.result).toMatchObject({ winnerSide: 'landlord', spring: 'spring', stake: 2 });
+    expect(state.result?.amounts).toEqual([6, -2, -2, -2]);
     expect(state.history.map((entry) => entry.trickNumber)).toEqual([1, 1, 1, 1, 2]);
   });
 
   it('4 players: anti-spring when the landlord only led once; no spring while a peasant played', () => {
     const start = playingState({ hands: ['3 3 K', '4 4 6', '7 8 9', '10 J Q'], landlord: 0 });
-    const { state } = run(start, [
-      [0, play('3', hand(start, 0))],
-      [1, play('6', hand(start, 1))],
-      [2, PASS],
-      [3, PASS],
-      [0, PASS],
-      [1, play('4 4', hand(start, 1))],
-    ]);
+    const { state } = script(start, '0:3|1:6|2:P|3:P|0:P|1:4 4');
     expect(state).toMatchObject({ phase: 'finished', playCounts: [1, 2, 0, 0] });
     expect(state.result).toMatchObject({ spring: 'anti_spring', amounts: [-6, 2, 2, 2] });
     const silent = settled({ hands: ['', '3', '4', '5'], landlord: 0, playCounts: [3, 1, 0, 0] });
@@ -298,20 +254,12 @@ describe('end of hand', () => {
   });
 
   it('bombsPlayed counts bombs and rockets from anyone, when leading too, but not four + two', () => {
-    const start = playingState({
-      hands: ['5 5 5 5 6 7 3', '9 9 9 9 K', 'BJ RJ 4 4 4 4 8'],
-      landlord: 0,
-    });
+    const hands = ['5 5 5 5 6 7 3', '9 9 9 9 K', 'BJ RJ 4 4 4 4 8'];
+    const start = playingState({ hands, landlord: 0 });
     const led = step(start, 0, play('5 5 5 5 6 7', hand(start, 0))).state;
     expect(led.trick.current?.type).toBe('four_two_single');
     expect(led.bombsPlayed).toBe(0);
-    const { state } = run(led, [
-      [1, play('9 9 9 9', hand(led, 1))],
-      [2, play('BJ RJ', hand(led, 2))],
-      [0, PASS],
-      [1, PASS],
-      [2, play('4 4 4 4', hand(led, 2))],
-    ]);
+    const { state } = script(led, '1:9 9 9 9|2:BJ RJ|0:P|1:P|2:4 4 4 4');
     expect(state.bombsPlayed).toBe(3);
     expect(state.playCounts).toEqual([1, 1, 2]);
     expect(currentStake(state)).toBe(8);
@@ -319,21 +267,54 @@ describe('end of hand', () => {
   });
 
   it('4 players: a 5-card bomb and a 3-joker rocket each count once', () => {
-    const start = playingState({
-      hands: ['3 3 3 3 3 K', 'BJ BJ RJ 5', 'RJ 6 9', '7 7 7 7 8'],
-      landlord: 0,
-    });
-    const { state } = run(start, [
-      [0, play('3 3 3 3 3', hand(start, 0))],
-      [1, play('BJ BJ RJ', hand(start, 1))],
-      [2, PASS],
-      [3, PASS],
-      [0, PASS],
-      [1, play('5', hand(start, 1))],
-    ]);
+    const hands = ['3 3 3 3 3 K', 'BJ BJ RJ 5', 'RJ 6 9', '7 7 7 7 8'];
+    const start = playingState({ hands, landlord: 0 });
+    const { state } = script(start, '0:3 3 3 3 3|1:BJ BJ RJ|2:P|3:P|0:P|1:5');
     expect(state).toMatchObject({ phase: 'finished', bombsPlayed: 2 });
     expect(state.result).toMatchObject({ bombs: 2, spring: 'anti_spring', stake: 8 });
     expect(state.result?.amounts).toEqual([-24, 8, 8, 8]);
+  });
+
+  it('going out with a bomb counts it; nothing beats a rocket in 3 players', () => {
+    const bomb = playingState({ hands: ['3 3 3 3', '4 5', 'BJ RJ 6'], landlord: 0 });
+    const out = step(bomb, 0, play('3 3 3 3', hand(bomb, 0)));
+    expect(types(out.events)).toEqual(['play', 'hand_finished']);
+    expect(out.state).toMatchObject({ phase: 'finished', bombsPlayed: 1, playCounts: [1, 0, 0] });
+    expect(out.state.result).toMatchObject({ bombs: 1, spring: 'spring', stake: 4 });
+    expect(out.state.result?.amounts).toEqual([8, -4, -4]);
+    const rocket = playingState({ hands: ['3 K', 'BJ RJ 4', '2 2 2 2 5'], landlord: 0 });
+    const led = script(rocket, '0:3|1:BJ RJ').state;
+    expect(led.trick.current?.type).toBe('rocket');
+    expect(rejection(applyAction(led, 2, play('2 2 2 2', hand(led, 2))))).toBe('does_not_beat');
+    expect(findPlays(hand(led, 2), led.trick.current, RULES_3P)).toEqual([]);
+    const { state } = script(led, '2:P|0:P|1:4');
+    expect(state.result).toMatchObject({ winnerSeat: 1, bombs: 1, spring: 'anti_spring' });
+    expect(state.result).toMatchObject({ stake: 4, amounts: [-8, 4, 4] });
+  });
+
+  it('3 players: spring when the peasants only ever passed (passes are not plays)', () => {
+    const start = playingState({ hands: ['3 3 4 4 K', '5 5 6', '7 7 8'], landlord: 0 });
+    const { state, events } = script(start, '0:3 3|1:P|2:P|0:4 4|1:P|2:P|0:K');
+    expect(types(events).filter((type) => type === 'pass')).toHaveLength(4);
+    expect(state).toMatchObject({ phase: 'finished', playCounts: [3, 0, 0], bombsPlayed: 0 });
+    expect(state.history.map((entry) => entry.trickNumber)).toEqual([1, 1, 1, 2, 2, 2, 3]);
+    expect(state.result).toMatchObject({ spring: 'spring', stake: 2, amounts: [4, -2, -2] });
+  });
+
+  it('a played hand: two robs, the doubling choices and a bomb all reach the settlement', () => {
+    const dealt = createHand({ rules: DOUBLING_3P, seed: 'robs', handNumber: 1, firstBidder: 0 });
+    const bid = script(dealt, '0:C|1:R|2:PB|0:R').state;
+    expect(bid).toMatchObject({ phase: 'doubling', landlord: 0, base: 1 });
+    expect(bid.bidding.robs).toBe(2);
+    const doubled = script(bid, '0:D1|1:D1|2:D0').state;
+    expect(doubled).toMatchObject({ phase: 'playing', turn: 0 });
+    expect(currentStake(doubled)).toBe(4);
+    const start: HandState = { ...doubled, hands: dealSpecs(['3 3 3 3 K', '4 5', '6 7']) };
+    const { state } = script(start, '0:3 3 3 3|1:P|2:P|0:K');
+    expect(currentStake(state)).toBe(8);
+    expect(state.result).toMatchObject({ winnerSide: 'landlord', base: 1, robs: 2, bombs: 1 });
+    expect(state.result).toMatchObject({ spring: 'spring', kittyBonus: 1, stake: 16 });
+    expect(state.result).toMatchObject({ doubled: [true, true, false], amounts: [96, -64, -32] });
   });
 });
 
@@ -355,20 +336,17 @@ describe('settle', () => {
 
   it('points mode: the winning bid is the base', () => {
     const rules = POINTS_3P;
-    expect(settled({ rules, hands: ['3', '', '4'], landlord: 0, base: 3 })).toMatchObject({
-      base: 3,
-      stake: 3,
-      amounts: [-6, 3, 3],
-    });
-    expect(settled({ rules, hands: ['', '3', '4'], landlord: 0, base: 2, bombs: 2 })).toMatchObject(
-      { stake: 8, amounts: [16, -8, -8] },
-    );
+    const lost = settled({ rules, hands: ['3', '', '4'], landlord: 0, base: 3 });
+    expect(lost).toMatchObject({ base: 3, stake: 3, amounts: [-6, 3, 3] });
+    const bombed = settled({ rules, hands: ['', '3', '4'], landlord: 0, base: 2, bombs: 2 });
+    expect(bombed).toMatchObject({ stake: 8, amounts: [16, -8, -8] });
+    const counts = [4, 0, 0];
     const spring = settled({
       rules,
       hands: ['', '3', '4'],
       landlord: 0,
       base: 3,
-      playCounts: [4, 0, 0],
+      playCounts: counts,
     });
     expect(spring).toMatchObject({ spring: 'spring', stake: 6, amounts: [12, -6, -6] });
   });
@@ -384,14 +362,10 @@ describe('settle', () => {
     expect(lose([2, 2, 0]).spring).toBeNull();
     const four = (hands: string[], counts: number[]): HandResult =>
       settled({ hands, landlord: 2, playCounts: counts });
-    expect(four(['3', '4', '', '5'], [0, 0, 5, 0])).toMatchObject({
-      spring: 'spring',
-      amounts: [-2, -2, 6, -2],
-    });
-    expect(four(['3', '4', '5', ''], [0, 0, 1, 3])).toMatchObject({
-      spring: 'anti_spring',
-      amounts: [2, 2, -6, 2],
-    });
+    const won = four(['3', '4', '', '5'], [0, 0, 5, 0]);
+    expect(won).toMatchObject({ spring: 'spring', amounts: [-2, -2, 6, -2] });
+    const anti = four(['3', '4', '5', ''], [0, 0, 1, 3]);
+    expect(anti).toMatchObject({ spring: 'anti_spring', amounts: [2, 2, -6, 2] });
     expect(four(['3', '4', '5', ''], [0, 0, 2, 3]).spring).toBeNull();
   });
 
@@ -413,25 +387,42 @@ describe('settle', () => {
       const off = settled({ rules: RULES_3P, hands: ['', '6', '7'], landlord: 0, kitty });
       expect(off).toMatchObject({ kittyBonus: 1, stake: 1 });
     }
-    const fourP = settled({
-      rules: BONUS_4P,
-      hands: ['', '6', '7', '8'],
-      landlord: 0,
-      kitty: 'RJ RJ 3 4 5 9 J K',
-      robs: 1,
-      bombs: 1,
-    });
+    const twoReds = { rules: BONUS_4P, hands: ['', '6', '7', '8'], landlord: 0, robs: 1, bombs: 1 };
+    const fourP = settled({ ...twoReds, kitty: 'RJ RJ 3 4 5 9 J K' });
     expect(fourP).toMatchObject({ kittyBonus: 1, stake: 4, amounts: [12, -4, -4, -4] });
     expect(kittyBonusMultiplier(cards('RJ RJ 3 4 5 9 J K'), BONUS_4P)).toBe(1);
   });
 
+  it('4 players: every kitty bonus row on an 8-card kitty, and larger 3-player kitties', () => {
+    const run8 = cards('3 4 5 6 7 8 9 10');
+    const mixed = run8.map((card, i) => (i === 0 ? makeCard(card.rank, 'H', 0) : card));
+    const rows: Array<[string | Card[], number]> = [
+      ['BJ RJ 3 4 5 6 7 8', 3],
+      ['5 5 5 3 4 8 J K', 3],
+      [run8, 3],
+      [mixed, 2],
+      ['RJ 3 4 5 6 7 8 J', 2],
+      ['3 3 4 4 5 5 7 9', 1],
+    ];
+    for (const [kitty, multiplier] of rows) {
+      const on = settled({ rules: BONUS_4P, hands: ['3', '', '4', '5'], landlord: 0, kitty });
+      expect(on).toMatchObject({ kittyBonus: multiplier, stake: multiplier });
+      expect(on.amounts).toEqual([-3 * multiplier, multiplier, multiplier, multiplier]);
+      const off = settled({ rules: RULES_4P, hands: ['3', '', '4', '5'], landlord: 0, kitty });
+      expect(off).toMatchObject({ kittyBonus: 1, stake: 1 });
+    }
+    expect(kittyBonusMultiplier(cards('BJ RJ 3 3'), BONUS_4P)).toBe(3);
+    expect(kittyBonusMultiplier(cards('3 4 5 6'), BONUS_4P)).toBe(3);
+    expect(kittyBonusMultiplier(cards('9 10 J Q K A'), BONUS_3P)).toBe(3);
+    expect(kittyBonusMultiplier(cards('J Q K A 2 BJ'), BONUS_3P)).toBe(2);
+    expect(kittyBonusMultiplier(cards('3 4 5 6 7 8 9 10 J Q K 2'), BONUS_3P)).toBe(1);
+  });
+
   it('doubling: the landlord doubles every settlement, a peasant only their own', () => {
     const base = { rules: DOUBLING_3P, hands: ['', '3', '4'], landlord: 0, robs: 1 };
-    expect(settled({ ...base, doubles: [true, false, false] })).toMatchObject({
-      stake: 2,
-      doubled: [true, false, false],
-      amounts: [8, -4, -4],
-    });
+    const landlordOnly = settled({ ...base, doubles: [true, false, false] });
+    expect(landlordOnly).toMatchObject({ stake: 2, doubled: [true, false, false] });
+    expect(landlordOnly.amounts).toEqual([8, -4, -4]);
     expect(settled({ ...base, doubles: [false, true, false] }).amounts).toEqual([6, -4, -2]);
     expect(settled({ ...base, doubles: [true, true, false] }).amounts).toEqual([12, -8, -4]);
     expect(settled({ ...base, doubles: [true, true, true] }).amounts).toEqual([16, -8, -8]);
@@ -451,12 +442,8 @@ describe('settle', () => {
 
 describe('currentStake', () => {
   it('multiplies base, robs, bombs and the revealed kitty bonus, never spring or doubles', () => {
-    const start = playingState({
-      rules: { ...BONUS_3P, doublingRound: true },
-      hands: ['3', '4', '5'],
-      landlord: 0,
-      kitty: 'BJ RJ 9',
-    });
+    const rules = { ...BONUS_3P, doublingRound: true };
+    const start = playingState({ rules, hands: ['3', '4', '5'], landlord: 0, kitty: 'BJ RJ 9' });
     const state: HandState = {
       ...start,
       bidding: { ...start.bidding, robs: 2 },
@@ -469,6 +456,25 @@ describe('currentStake', () => {
     expect(done.result).toMatchObject({ spring: 'spring', stake: 48 });
     expect(currentStake(done)).toBe(24);
     expect(viewHand(done, 1).currentStake).toBe(24);
+  });
+
+  it('counts the robs at once but the kitty bonus only once the kitty is revealed', () => {
+    const deal = (i: number): HandState =>
+      createHand({ rules: BONUS_3P, seed: `stake-${i}`, handNumber: 1, firstBidder: 0 });
+    let dealt = deal(0);
+    for (let i = 1; kittyBonusMultiplier(dealt.kitty, BONUS_3P) !== 3 && i < 5000; i++) {
+      dealt = deal(i);
+    }
+    expect(kittyBonusMultiplier(dealt.kitty, BONUS_3P)).toBe(3);
+    expect(currentStake(dealt)).toBe(1);
+    const robbed = script(dealt, '0:C|1:R').state;
+    expect(robbed).toMatchObject({ phase: 'bidding', kittyRevealed: false });
+    expect(viewHand(robbed, null)).toMatchObject({ currentStake: 2, kitty: null });
+    const chosen = script(robbed, '2:PB|0:PB').state;
+    expect(chosen).toMatchObject({ landlord: 1, kittyRevealed: true, phase: 'playing' });
+    expect(chosen.bidding.robs).toBe(1);
+    expect(currentStake(chosen)).toBe(6);
+    expect(viewHand(chosen, 2).currentStake).toBe(6);
   });
 });
 
@@ -507,11 +513,7 @@ describe('viewHand', () => {
       expect(viewHand(dealt, viewer).kitty).toBeNull();
     }
     expect('hands' in viewHand(dealt, 0)).toBe(false);
-    const chosen = run(dealt, [
-      [0, CALL],
-      [1, PASS_BID],
-      [2, PASS_BID],
-    ]).state;
+    const chosen = script(dealt, '0:C|1:PB|2:PB').state;
     expect(chosen.phase).toBe('doubling');
     for (const viewer of [0, 1, 2, null]) {
       expectNoLeak(chosen, viewer);
@@ -535,12 +537,7 @@ describe('viewHand', () => {
 
   it('hides other seats doubling choices until the round ends, then shows them to all', () => {
     const dealt = createHand({ rules: DOUBLING_3P, seed: 'view', handNumber: 1, firstBidder: 0 });
-    const doubling = run(dealt, [
-      [0, CALL],
-      [1, PASS_BID],
-      [2, PASS_BID],
-      [1, { type: 'double', double: true }],
-    ]).state;
+    const doubling = script(dealt, '0:C|1:PB|2:PB|1:D1').state;
     expect(doubling.doubles).toEqual([null, true, null]);
     expect(viewHand(doubling, 1).doubles).toEqual([null, true, null]);
     expect(viewHand(doubling, 0).doubles).toEqual([null, null, null]);
@@ -548,10 +545,7 @@ describe('viewHand', () => {
     expect(viewHand(doubling, null).doubles).toEqual([null, null, null]);
     expect(viewHand(doubling, 2).legal.canDouble).toBe(true);
     expect(viewHand(doubling, 1).legal.canDouble).toBe(false);
-    const playing = run(doubling, [
-      [0, { type: 'double', double: false }],
-      [2, { type: 'double', double: true }],
-    ]).state;
+    const playing = script(doubling, '0:D0|2:D1').state;
     expect(playing.phase).toBe('playing');
     for (const viewer of [0, 1, 2, null]) {
       expect(viewHand(playing, viewer).doubles).toEqual([false, true, true]);
@@ -559,7 +553,27 @@ describe('viewHand', () => {
   });
 });
 
-describe('timeoutAction while playing', () => {
+describe('timeoutAction', () => {
+  it('bidding: call for the forced last bidder (who becomes landlord at base 1), else pass', () => {
+    const fresh = (rules: RuleSettings, firstBidder: number): HandState =>
+      createHand({ rules, seed: 'forced', handNumber: 1, firstBidder });
+    const three = script(fresh(RULES_3P, 1), '1:PB|2:PB').state;
+    expect(three.turn).toBe(0);
+    expect(timeoutAction(three, 0)).toEqual(CALL);
+    expect(legalActions(three, 0)).toMatchObject({ canCall: true, canPassBid: false });
+    const forced = step(three, 0, timeoutAction(three, 0)).state;
+    expect(forced).toMatchObject({ phase: 'playing', landlord: 0, base: 1, turn: 0 });
+    expect(currentStake(forced)).toBe(1);
+    const four = script(fresh(RULES_4P, 3), '3:PB|0:PB').state;
+    expect(timeoutAction(four, 1)).toEqual(PASS_BID);
+    const last = step(four, 1, PASS_BID).state;
+    expect(timeoutAction(last, 2)).toEqual(CALL);
+    expect(step(last, 2, timeoutAction(last, 2)).state).toMatchObject({ landlord: 2, turn: 2 });
+    const redeal = script(fresh({ ...RULES_3P, allPass: 'redeal' }, 1), '1:PB|2:PB').state;
+    expect(timeoutAction(redeal, 0)).toEqual(PASS_BID);
+    expect(step(redeal, 0, PASS_BID).state.phase).toBe('redeal');
+  });
+
   it('leads the lowest single of the remaining hand and passes when answering', () => {
     const start = playingState({ hands: ['K 5 9 3 BJ', '4 6 8 10 2', '7 J Q A RJ'], landlord: 0 });
     const rankId = (state: HandState, seat: number, rank: number): string =>
@@ -567,10 +581,7 @@ describe('timeoutAction while playing', () => {
     expect(timeoutAction(start, 0)).toEqual({ type: 'play', cardIds: [rankId(start, 0, 3)] });
     const led = step(start, 0, timeoutAction(start, 0)).state;
     expect(timeoutAction(led, 1)).toEqual({ type: 'pass' });
-    const later = run(led, [
-      [1, PASS],
-      [2, PASS],
-    ]).state;
+    const later = script(led, '1:P|2:P').state;
     expect(later.turn).toBe(0);
     expect(timeoutAction(later, 0)).toEqual({ type: 'play', cardIds: [rankId(later, 0, 5)] });
     expect(applyAction(later, 0, timeoutAction(later, 0)).ok).toBe(true);
@@ -677,24 +688,71 @@ function checkFinished(state: HandState): void {
   expect(ids(all).sort()).toEqual(ids(createDeck(state.rules.playerCount)).sort());
 }
 
+/**
+ * The seat on turn: every listed play is accepted, random card subsets are accepted exactly when
+ * their rank structure is a listed play, nobody else may act, and a leader cannot pass.
+ */
+function checkTurn(state: HandState, rng: () => number): void {
+  const seat = state.turn;
+  const own = hand(state, seat);
+  const plays = findPlays(own, state.trick.current, state.rules);
+  const keys = new Set(plays.map((combo) => key(combo.cards)));
+  for (const combo of plays) {
+    expect(applyAction(state, seat, { type: 'play', cardIds: ids(combo.cards) }).ok).toBe(true);
+  }
+  for (let i = 0; i < 4; i++) {
+    const pool = own.slice();
+    const subset: Card[] = [];
+    for (let n = 1 + Math.floor(rng() * Math.min(pool.length, 8)); n > 0; n--) {
+      subset.push(...pool.splice(Math.floor(rng() * pool.length), 1));
+    }
+    const result = applyAction(state, seat, { type: 'play', cardIds: ids(subset) });
+    const label = `${key(subset)} on ${state.trick.current?.type ?? 'lead'}`;
+    expect(result.ok, label).toBe(keys.has(key(subset)));
+    if (!result.ok) expect(['invalid_combo', 'does_not_beat'], label).toContain(result.code);
+  }
+  for (let other = 0; other < state.rules.playerCount; other++) {
+    if (other !== seat) expect(rejection(applyAction(state, other, PASS))).toBe('not_your_turn');
+  }
+  if (state.trick.current === null) {
+    expect(rejection(applyAction(state, seat, PASS))).toBe('cannot_pass');
+  }
+}
+
 function playout(seed: string, rules: RuleSettings): HandState {
   const rng = seededRng(seed);
   const firstBidder = Math.floor(rng() * rules.playerCount);
   let state = createHand({ rules, seed, handNumber: 1, firstBidder });
+  let trickWins = 0;
   for (let steps = 0; state.phase !== 'finished'; steps++) {
     if (steps > 1500) throw new Error(`${seed} did not finish`);
     expect(state.phase).not.toBe('redeal');
-    if (state.phase === 'playing') {
-      for (const viewer of [...state.hands.keys(), null]) expectNoLeak(state, viewer);
-      expect(applyAction(state, state.turn, timeoutAction(state, state.turn)).ok).toBe(true);
+    for (const viewer of [...state.hands.keys(), null]) expectNoLeak(state, viewer);
+    for (const seat of actingSeats(state)) {
+      expect(applyAction(state, seat, timeoutAction(state, seat)).ok).toBe(true);
     }
+    if (state.phase === 'playing') checkTurn(state, rng);
     for (const seat of actingSeats(state)) {
       const result = applyAction(state, seat, randomAction(state, seat, rng));
       if (!result.ok) throw new Error(`${seed}: ${result.code} ${result.error}`);
+      for (const event of result.events) {
+        if (event.type === 'trick_won') {
+          trickWins++;
+          expect(result.state.turn).toBe(event.seat);
+          expect(result.state.trick).toEqual({
+            leader: event.seat,
+            plays: [],
+            current: null,
+            currentSeat: null,
+          });
+        }
+        if (event.type === 'hand_finished') expect(event.result).toEqual(result.state.result);
+      }
       state = result.state;
       if (state.phase === 'finished') break;
     }
   }
+  expect(trickWins).toBe(new Set(state.history.map((entry) => entry.trickNumber)).size - 1);
   return state;
 }
 
@@ -704,128 +762,22 @@ describe('random legal playouts', () => {
       RULES_3P,
       { ...POINTS_3P, kittyBonus: true },
       { ...DOUBLING_3P, kittyBonus: true, kittySize: 6 },
+      { ...RULES_3P, kittySize: 12, chainsThroughTwos: false },
     ];
     for (let i = 0; i < 24; i++) {
       checkFinished(playout(`verify-3p-${i}`, variants[i % variants.length] as RuleSettings));
     }
-  });
+  }, 120000);
 
   it('4 players: keep every play and settlement invariant', () => {
     const variants: RuleSettings[] = [
       RULES_4P,
       { ...RULES_4P, biddingMode: 'points', doublingRound: true, kittyBonus: true },
+      { ...RULES_4P, kittySize: 16, chainsThroughTwos: false, kittyBonus: true },
+      { ...RULES_4P, kittySize: 4, doublingRound: true },
     ];
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 12; i++) {
       checkFinished(playout(`verify-4p-${i}`, variants[i % variants.length] as RuleSettings));
     }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// EXPLORATION (temporary)
-// ---------------------------------------------------------------------------
-
-import { key } from '../test-helpers';
-
-function pickSubset(hand: Card[], rng: () => number): Card[] {
-  const size = 1 + Math.floor(rng() * Math.min(hand.length, 8));
-  const pool = hand.slice();
-  const out: Card[] = [];
-  for (let i = 0; i < size; i++) {
-    const index = Math.floor(rng() * pool.length);
-    out.push(...pool.splice(index, 1));
-  }
-  return out;
-}
-
-function checkPlayingState(state: HandState, rng: () => number, label: string): void {
-  const seat = state.turn;
-  const current = state.trick.current;
-  const plays = findPlays(hand(state, seat), current, state.rules);
-  const keys = new Set(plays.map((combo) => key(combo.cards)));
-  for (const combo of plays) {
-    const result = applyAction(state, seat, { type: 'play', cardIds: ids(combo.cards) });
-    if (!result.ok) throw new Error(`${label}: listed play rejected ${result.code} ${key(combo.cards)}`);
-  }
-  for (let i = 0; i < 6; i++) {
-    const subset = pickSubset(hand(state, seat), rng);
-    const result = applyAction(state, seat, { type: 'play', cardIds: ids(subset) });
-    const listed = keys.has(key(subset));
-    if (result.ok !== listed) {
-      throw new Error(
-        `${label}: subset ${key(subset)} listed=${listed} ok=${result.ok} ${result.ok ? '' : result.code} current=${current ? `${current.type}/${current.rank}/${current.length}` : 'lead'}`,
-      );
-    }
-    if (!result.ok && result.code !== 'invalid_combo' && result.code !== 'does_not_beat') {
-      throw new Error(`${label}: unexpected code ${result.code}`);
-    }
-  }
-  for (let other = 0; other < state.rules.playerCount; other++) {
-    if (other === seat) continue;
-    expect(rejection(applyAction(state, other, PASS))).toBe('not_your_turn');
-    const first = hand(state, other)[0] as Card;
-    expect(rejection(applyAction(state, other, { type: 'play', cardIds: [first.id] }))).toBe(
-      'not_your_turn',
-    );
-  }
-  if (current === null) {
-    expect(rejection(applyAction(state, seat, PASS))).toBe('cannot_pass');
-  }
-}
-
-function explore(seed: string, rules: RuleSettings): HandState {
-  const rng = seededRng(seed);
-  const firstBidder = Math.floor(rng() * rules.playerCount);
-  let state = createHand({ rules, seed, handNumber: 1, firstBidder });
-  let trickWins = 0;
-  for (let steps = 0; state.phase !== 'finished'; steps++) {
-    if (steps > 1500) throw new Error(`${seed} did not finish`);
-    if (state.phase === 'redeal') return state;
-    for (const viewer of [...state.hands.keys(), null]) expectNoLeak(state, viewer);
-    for (const seat of actingSeats(state)) {
-      expect(applyAction(state, seat, timeoutAction(state, seat)).ok).toBe(true);
-    }
-    if (state.phase === 'playing') checkPlayingState(state, rng, `${seed}#${steps}`);
-    for (const seat of actingSeats(state)) {
-      const result = applyAction(state, seat, randomAction(state, seat, rng));
-      if (!result.ok) throw new Error(`${seed}: ${result.code} ${result.error}`);
-      for (const event of result.events) {
-        if (event.type === 'trick_won') {
-          trickWins++;
-          expect(result.state.turn).toBe(event.seat);
-          expect(result.state.trick).toEqual({ leader: event.seat, plays: [], current: null, currentSeat: null });
-        }
-        if (event.type === 'hand_finished') expect(event.result).toEqual(result.state.result);
-      }
-      state = result.state;
-      if (state.phase === 'finished') break;
-    }
-  }
-  const tricks = new Set(state.history.map((entry) => entry.trickNumber)).size;
-  expect(trickWins).toBe(tricks - 1);
-  return state;
-}
-
-describe('EXPLORATION', () => {
-  it('sweep', () => {
-    const variants: RuleSettings[] = [
-      RULES_3P,
-      { ...RULES_3P, kittySize: 12, chainsThroughTwos: false },
-      { ...RULES_3P, kittySize: 9, biddingMode: 'points', doublingRound: true, kittyBonus: true },
-      { ...RULES_3P, kittySize: 6, kittyBonus: true, allPass: 'redeal' },
-      RULES_4P,
-      { ...RULES_4P, kittySize: 16, chainsThroughTwos: false, kittyBonus: true },
-      { ...RULES_4P, kittySize: 4, biddingMode: 'points', doublingRound: true },
-      { ...RULES_4P, kittySize: 12, allPass: 'redeal', kittyBonus: true },
-    ];
-    let finished = 0;
-    for (let i = 0; i < 160; i++) {
-      const state = explore(`explore-${i}`, variants[i % variants.length] as RuleSettings);
-      if (state.phase === 'finished') {
-        checkFinished(state);
-        finished++;
-      }
-    }
-    expect(finished).toBeGreaterThan(100);
-  }, 300000);
+  }, 120000);
 });

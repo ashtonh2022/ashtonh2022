@@ -1,47 +1,50 @@
-import { createServer } from 'node:http';
-import { WebSocketServer } from 'ws';
-
 import { ENGINE_VERSION } from '@landlord/engine';
 import { PROTOCOL_VERSION } from '@landlord/protocol';
 
-import { createStaticHandler, resolveWebDist } from './static';
+import { consoleLogger } from './log';
+import { startServer } from './server';
 
-const PORT = Number(process.env.PORT ?? 8080);
-const webDist = resolveWebDist();
-const serveStatic = createStaticHandler(webDist);
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
 
-const server = createServer((req, res) => {
-  const { pathname } = new URL(req.url ?? '/', 'http://localhost');
+const log = consoleLogger;
+const port = envNumber('PORT', 8080);
+const host = process.env.HOST?.trim() || '0.0.0.0';
+const roomTtlMinutes = envNumber('ROOM_TTL_MINUTES', 120);
 
-  if (pathname === '/healthz') {
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: true }));
-    return;
-  }
-
-  void serveStatic(req, res);
+process.on('unhandledRejection', (reason) => {
+  log.error('unhandled rejection', reason);
 });
 
-const wss = new WebSocketServer({ noServer: true });
-
-wss.on('connection', (socket) => {
-  socket.send(JSON.stringify({ type: 'hello' }));
-});
-
-server.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url ?? '/', 'http://localhost');
-  if (pathname !== '/ws') {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
+startServer({ port, host, roomTtlMinutes, log })
+  .then((server) => {
+    log.info(
+      `landlord server listening on http://${server.host}:${server.port} ` +
+        `(engine ${ENGINE_VERSION}, protocol v${PROTOCOL_VERSION}, ` +
+        `room ttl ${roomTtlMinutes} min, static: ${server.webDist})`,
+    );
+    let stopping = false;
+    const shutdown = (signal: string): void => {
+      if (stopping) return;
+      stopping = true;
+      log.info(`${signal} received, shutting down`);
+      server
+        .close()
+        .then(() => process.exit(0))
+        .catch((err: unknown) => {
+          log.error('shutdown failed', err);
+          process.exit(1);
+        });
+      setTimeout(() => process.exit(0), 5_000).unref();
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  })
+  .catch((err: unknown) => {
+    log.error('failed to start', err);
+    process.exit(1);
   });
-});
-
-server.listen(PORT, () => {
-  console.log(
-    `landlord server listening on http://localhost:${PORT} ` +
-      `(engine ${ENGINE_VERSION}, protocol v${PROTOCOL_VERSION}, static: ${webDist})`,
-  );
-});
