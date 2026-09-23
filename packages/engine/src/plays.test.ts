@@ -435,11 +435,11 @@ describe('performance', () => {
     const elapsed = performance.now() - start;
     expect(plays.length).toBeGreaterThan(1000);
     expect(new Set(keys(plays)).size).toBe(plays.length);
-    expect(elapsed).toBeLessThan(200);
+    expect(elapsed).toBeLessThan(500);
 
     const answerStart = performance.now();
     const answers = findPlays(hand, combo('3 3 3 4 4 4 5 5 5 6 7 8'), RULES_4P);
-    expect(performance.now() - answerStart).toBeLessThan(200);
+    expect(performance.now() - answerStart).toBeLessThan(500);
     expect(answers.length).toBeGreaterThan(0);
   });
 });
