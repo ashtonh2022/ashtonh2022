@@ -10,6 +10,10 @@
  * - RoomView.redealt: true on the first snapshot after everyone passed and the cards were redealt.
  * - RoomView.resultSeats: who each seat's share of lastResult was charged to (whoever was seated
  *   when the hand was dealt). Seats may have changed hands since, so SeatView cannot say.
+ * - left_room.reason / left_room.code: why you are no longer in a room ('kicked' by the host, or
+ *   'left' yourself) and which room it was. Absent means 'left'.
+ * - notice: one-off information for you alone, e.g. the host moved you from your seat to the
+ *   spectators in the lobby.
  */
 import { z } from 'zod';
 import type { HandAction, HandResult, HandView, RuleSettings } from '@landlord/engine';
@@ -152,10 +156,17 @@ export interface RoomView {
   chat: ChatEntry[];
 }
 
+/** Why you are no longer in a room: you left (or joined another room), or the host kicked you. */
+export type LeaveReason = 'left' | 'kicked';
+
+/** One-off notices sent to a single player. `code` is the room code. */
+export type NoticeCode = 'moved_to_spectators';
+
 export type ServerMessage =
   | { type: 'welcome'; playerId: string; token: string; name: string; protocol: number }
   | { type: 'room_state'; room: RoomView }
-  | { type: 'left_room' }
+  | { type: 'left_room'; reason?: LeaveReason; code?: string }
+  | { type: 'notice'; notice: NoticeCode; code: string }
   | { type: 'chat'; entry: ChatEntry }
   | { type: 'emote'; playerId: string; seat: number | null; emote: Emote }
   | { type: 'error'; code: ServerErrorCode; message: string }
