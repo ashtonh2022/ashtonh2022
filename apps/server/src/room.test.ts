@@ -6,17 +6,31 @@ import type { ClientMessage, RoomView, ServerMessage } from '@landlord/protocol'
 import type { Connection } from './connection';
 import { Hub } from './hub';
 import { silentLogger } from './log';
-import type { Room } from './room';
+import { FORMER_MEMBERS_KEPT, SPECTATOR_GRACE_MS, type Room } from './room';
 import { cleanName, recordKick } from './players';
 import { DEFAULT_ROOM_TTL_MS } from './rooms';
 
 type Hello = Extract<ClientMessage, { type: 'hello' }>;
 type ErrorMessage = Extract<ServerMessage, { type: 'error' }>;
 
-/** A connection with a recording transport; `hello` is sent on construction. */
+let tabCount = 0;
+
+/** A tab id nobody has used yet, as a newly opened browser tab makes one. */
+function newTabId(): string {
+  tabCount += 1;
+  return tabCount.toString(16).padStart(16, '0');
+}
+
+/**
+ * A connection with a recording transport; `hello` is sent on construction. It speaks for a
+ * browser tab of its own unless `hello.tab` says which (undefined: an older client that sends no
+ * tab id).
+ */
 class FakeClient {
   readonly sent: ServerMessage[] = [];
   readonly conn: Connection;
+  /** The tab id its hello carried. */
+  readonly tab: string | undefined;
   closedByServer = false;
 
   constructor(
@@ -25,6 +39,7 @@ class FakeClient {
     /** The client's IP limit key, as server.ts would pass it; none for an in-process client. */
     ip?: string,
   ) {
+    this.tab = 'tab' in hello ? hello.tab : newTabId();
     this.conn = hub.connect(
       {
         send: (data) => {
@@ -36,7 +51,17 @@ class FakeClient {
       },
       ip,
     );
-    this.send({ type: 'hello', protocol: 1, ...hello });
+    this.send({ type: 'hello', protocol: 1, ...hello, tab: this.tab });
+  }
+
+  /** The same tab on a new connection (a reload, or the socket coming back). */
+  reconnect(): FakeClient {
+    return new FakeClient(this.hub, { playerId: this.playerId, token: this.token, tab: this.tab });
+  }
+
+  /** Another tab of the same player, opened now. */
+  newTab(): FakeClient {
+    return new FakeClient(this.hub, { playerId: this.playerId, token: this.token });
   }
 
   send(message: ClientMessage | Record<string, unknown>): void {
@@ -1463,24 +1488,32 @@ describe('telling players why they left', () => {
     expect(guest.count('notice')).toBe(3);
   });
 
-  it('tells a player kicked while disconnected in the lobby on every hello, once per socket', () => {
+  it('tells each tab of a player kicked while disconnected in the lobby on its hello, once per socket', () => {
     const hub = createHub();
     hub.start();
     const { host, guests, room } = table(hub, {}, 1);
     const guest = guests[0] as FakeClient;
+    const otherTab = guest.newTab();
     guest.disconnect();
+    otherTab.disconnect();
     host.send({ type: 'kick', seat: 1 });
     expect(room.isMember(guest.playerId)).toBe(false);
     // Kept through the periodic sweeps, which forget players with no connection and no room.
     vi.advanceTimersByTime(5 * 60_000);
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = guest.reconnect();
     // Before the welcome: a client rejoins its room on every welcome, so it must know first.
     expect(back.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
     expect(back.sent[0]).toEqual({ type: 'left_room', reason: 'kicked', code: room.code });
-    // Another tab of the same browser coming back is told too (it would rejoin as well).
-    const tab = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    // Another tab of the same browser that was in the room is told too (it would rejoin as well).
+    const tab = otherTab.reconnect();
     expect(tab.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
-    back.send({ type: 'hello', protocol: 1, playerId: guest.playerId, token: guest.token });
+    back.send({
+      type: 'hello',
+      protocol: 1,
+      playerId: guest.playerId,
+      token: guest.token,
+      tab: back.tab,
+    });
     expect(back.count('left_room')).toBe(1);
     hub.stop();
   });
@@ -1495,7 +1528,7 @@ describe('telling players why they left', () => {
     expect(room.seats[1]).toMatchObject({ playerId: null, isBot: true });
     host.send({ type: 'leave_room' });
     expect(room.isDestroyed).toBe(true);
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = guest.reconnect();
     expect(back.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
     expect(back.sent[0]).toEqual({ type: 'left_room', reason: 'kicked', code: room.code });
     expect(back.room).toBeNull();
@@ -1511,7 +1544,7 @@ describe('telling players why they left', () => {
     host.send({ type: 'kick', seat: 1 });
     expect(host.view.spectators).toEqual([]);
     expect(host.view.seats[1]?.playerId).toBeNull();
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = guest.reconnect();
     expect(back.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
     expect(back.sent[0]).toEqual({ type: 'left_room', reason: 'kicked', code: room.code });
     // Joining again afterwards is a fresh start as a spectator.
@@ -1528,20 +1561,20 @@ describe('telling players why they left', () => {
     a.disconnect();
     const playerA = hub.players.get(a.playerId);
     if (playerA === undefined) throw new Error('player forgotten');
-    recordKick(playerA, room.code, Date.now(), 'removed');
-    const backA = new FakeClient(hub, { playerId: a.playerId, token: a.token });
+    recordKick(playerA, room.code, Date.now(), 'removed', [a.tab as string]);
+    const backA = a.reconnect();
     expect(backA.count('left_room')).toBe(0);
     expect(playerA.pendingKick).toBeNull();
-    // Nor, once they have joined it again, is a tab they open afterwards.
+    // Nor, once they have joined it again, is another tab of theirs that was in the room.
+    const b2 = b.newTab();
     b.disconnect();
+    b2.disconnect();
     host.send({ type: 'kick', seat: 2 });
-    const backB = new FakeClient(hub, { playerId: b.playerId, token: b.token });
+    const backB = b.reconnect();
     expect(backB.count('left_room')).toBe(1);
     backB.send({ type: 'join_room', code: room.code });
     expect(hub.players.get(b.playerId)?.pendingKick).toBeNull();
-    expect(new FakeClient(hub, { playerId: b.playerId, token: b.token }).count('left_room')).toBe(
-      0,
-    );
+    expect(b2.reconnect().count('left_room')).toBe(0);
     expect(host.errors).toEqual([]);
   });
 
@@ -1561,7 +1594,7 @@ describe('telling players why they left', () => {
     expect(room.seats[1]).toMatchObject({ playerId: null, isBot: true });
     // The heartbeat drops the dead socket; the phone comes back with a new one.
     guest.disconnect();
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = guest.reconnect();
     expect(back.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
     expect(back.sent[0]).toEqual({ type: 'left_room', reason: 'kicked', code: room.code });
   });
@@ -1573,7 +1606,7 @@ describe('telling players why they left', () => {
     host.send({ type: 'kick', seat: 1 });
     expect(guest.sent[guest.sent.length - 1]?.type).toBe('notice');
     guest.disconnect();
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = guest.reconnect();
     // After the snapshot that shows them among the spectators, as when it happens live.
     expect(back.sent.map((m) => m.type)).toEqual(['welcome', 'room_state', 'notice']);
     expect(back.sent[2]).toEqual({
@@ -1588,7 +1621,7 @@ describe('telling players why they left', () => {
     // Once they have taken a seat again it is old news.
     back.send({ type: 'sit', seat: 1 });
     back.disconnect();
-    const later = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const later = back.reconnect();
     expect(later.count('notice')).toBe(0);
   });
 
@@ -1601,7 +1634,7 @@ describe('telling players why they left', () => {
     // Anything sent on the connection afterwards shows the notice got through.
     a.send({ type: 'ping' });
     a.disconnect();
-    const aBack = new FakeClient(hub, { playerId: a.playerId, token: a.token });
+    const aBack = a.reconnect();
     expect(aBack.count('notice')).toBe(0);
 
     host.send({ type: 'fill_bots' });
@@ -1610,7 +1643,7 @@ describe('telling players why they left', () => {
     expect(b.count('left_room')).toBe(1);
     b.send({ type: 'ping' });
     b.disconnect();
-    const bBack = new FakeClient(hub, { playerId: b.playerId, token: b.token });
+    const bBack = b.reconnect();
     expect(bBack.sent.map((m) => m.type)).toEqual(['welcome']);
     // Their link to the room still works.
     bBack.send({ type: 'join_room', code: room.code });
@@ -1621,13 +1654,13 @@ describe('telling players why they left', () => {
     const hub = createHub();
     const { host, guests, room } = table(hub, {}, 1);
     const guest = guests[0] as FakeClient;
-    const deadTab = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const deadTab = guest.newTab();
     host.send({ type: 'start_hand' });
     host.send({ type: 'kick', seat: 1 });
     // One tab answers; the other's socket had died unnoticed and is dropped later.
     guest.send({ type: 'ping' });
     deadTab.disconnect();
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = deadTab.reconnect();
     expect(back.sent[0]).toEqual({ type: 'left_room', reason: 'kicked', code: room.code });
   });
 
@@ -1635,18 +1668,17 @@ describe('telling players why they left', () => {
     const hub = createHub();
     const { host, guests, room } = table(hub, {}, 1);
     const guest = guests[0] as FakeClient;
-    const id = { playerId: guest.playerId, token: guest.token };
-    const otherTab = new FakeClient(hub, id);
+    const otherTab = guest.newTab();
     host.send({ type: 'start_hand' });
     // The laptop sleeps with both tabs on the room.
     guest.disconnect();
     otherTab.disconnect();
     host.send({ type: 'kick', seat: 1 });
     // It wakes and both tabs reconnect, one after the other.
-    const tab1 = new FakeClient(hub, id);
+    const tab1 = guest.reconnect();
     expect(tab1.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
     tab1.send({ type: 'ping' });
-    const tab2 = new FakeClient(hub, id);
+    const tab2 = otherTab.reconnect();
     expect(tab2.sent.map((m) => m.type)).toEqual(['left_room', 'welcome']);
     expect(tab2.sent[0]).toEqual({ type: 'left_room', reason: 'kicked', code: room.code });
     // Neither rejoined, so neither hears from the room as the bots play on.
@@ -1654,9 +1686,10 @@ describe('telling players why they left', () => {
     expect(host.count('room_state')).toBeGreaterThan(0);
     expect(tab1.count('room_state')).toBe(0);
     expect(tab2.count('room_state')).toBe(0);
-    // Joining or creating a room is moving on: a tab opened afterwards is not told.
+    // Joining or creating a room is moving on: a tab that has not answered yet is not told again.
     tab1.send({ type: 'create_room', rules: {} });
-    expect(new FakeClient(hub, id).count('left_room')).toBe(0);
+    tab2.disconnect();
+    expect(tab2.reconnect().count('left_room')).toBe(0);
   });
 
   it('forgets a pending kick, and the player, after two hours', () => {
@@ -1670,8 +1703,328 @@ describe('telling players why they left', () => {
     expect(hub.players.get(guest.playerId)?.pendingKick).not.toBeNull();
     vi.advanceTimersByTime(60_000);
     expect(hub.players.get(guest.playerId)).toBeUndefined();
-    const back = new FakeClient(hub, { playerId: guest.playerId, token: guest.token });
+    const back = guest.reconnect();
     expect(back.sent.map((m) => m.type)).toEqual(['welcome']);
     hub.stop();
+  });
+});
+
+describe('telling each tab about a kick', () => {
+  const types = (client: FakeClient) => client.sent.map((m) => m.type);
+  const kicked = (code: string): ServerMessage => ({ type: 'left_room', reason: 'kicked', code });
+  const moved = (code: string): ServerMessage => ({
+    type: 'notice',
+    notice: 'moved_to_spectators',
+    code,
+  });
+
+  /** What the web client does after a welcome: rejoin its room, unless it was kicked from it. */
+  function rejoinLikeTheWebClient(client: FakeClient, code: string): void {
+    const told = client.sent.some(
+      (m) => m.type === 'left_room' && m.reason === 'kicked' && m.code === code,
+    );
+    if (!told) client.send({ type: 'join_room', code });
+  }
+
+  function pendingKick(hub: Hub, client: FakeClient) {
+    return hub.players.get(client.playerId)?.pendingKick ?? null;
+  }
+
+  it('does not tell a tab again after it answered, when it reloads (kicked during a hand)', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const guest = guests[0] as FakeClient;
+    host.send({ type: 'start_hand' });
+    guest.disconnect();
+    host.send({ type: 'kick', seat: 1 });
+    const back = guest.reconnect();
+    expect(types(back)).toEqual(['left_room', 'welcome']);
+    expect(back.sent[0]).toEqual(kicked(room.code));
+    // The web client acknowledges at once.
+    back.send({ type: 'ping' });
+    expect(pendingKick(hub, guest)).toBeNull();
+    back.disconnect();
+    const reloaded = back.reconnect();
+    expect(types(reloaded)).toEqual(['welcome']);
+    expect(reloaded.room).toBeNull();
+  });
+
+  it('does not tell a tab again after it answered, when it reloads (moved to the spectators)', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const guest = guests[0] as FakeClient;
+    host.send({ type: 'kick', seat: 1 });
+    expect(guest.sent.at(-1)).toEqual(moved(room.code));
+    // The socket had died unnoticed: the notice never arrived.
+    guest.disconnect();
+    const back = guest.reconnect();
+    expect(types(back)).toEqual(['welcome', 'room_state', 'notice']);
+    back.send({ type: 'ping' });
+    back.disconnect();
+    const reloaded = back.reconnect();
+    expect(types(reloaded)).toEqual(['welcome', 'room_state']);
+    expect(reloaded.view.you.seat).toBeNull();
+  });
+
+  it('tells a tab whose socket had closed before the kick, after another tab heard it live', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const a = guests[0] as FakeClient;
+    // A second tab on the room, whose socket closes (a background tab, a sleeping laptop).
+    const b = a.newTab();
+    expect(b.view.code).toBe(room.code);
+    host.send({ type: 'start_hand' });
+    b.disconnect();
+    host.send({ type: 'kick', seat: 1 });
+    expect(a.sent.at(-1)).toEqual(kicked(room.code));
+    a.send({ type: 'ping' });
+    const bBack = b.reconnect();
+    expect(types(bBack)).toEqual(['left_room', 'welcome']);
+    expect(bBack.sent[0]).toEqual(kicked(room.code));
+    rejoinLikeTheWebClient(bBack, room.code);
+    expect(room.isMember(a.playerId)).toBe(false);
+    expect(bBack.room).toBeNull();
+    // It answered too: nobody is left to tell.
+    bBack.send({ type: 'ping' });
+    expect(pendingKick(hub, a)).toBeNull();
+  });
+
+  it('tells a tab whose socket had closed that it was moved, after another tab heard it live', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const a = guests[0] as FakeClient;
+    const b = a.newTab();
+    b.disconnect();
+    host.send({ type: 'kick', seat: 1 });
+    expect(a.sent.at(-1)).toEqual(moved(room.code));
+    a.send({ type: 'ping' });
+    const bBack = b.reconnect();
+    expect(types(bBack)).toEqual(['welcome', 'room_state', 'notice']);
+    expect(bBack.sent[2]).toEqual(moved(room.code));
+    expect(bBack.view.you.seat).toBeNull();
+  });
+
+  it('does not tell a brand-new tab, which may open the room link and watch', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const guest = guests[0] as FakeClient;
+    host.send({ type: 'start_hand' });
+    guest.disconnect();
+    host.send({ type: 'kick', seat: 1 });
+    const fresh = guest.newTab();
+    expect(types(fresh)).toEqual(['welcome']);
+    fresh.send({ type: 'join_room', code: room.code });
+    expect(fresh.lastError).toBeNull();
+    expect(fresh.view.you.seat).toBeNull();
+    expect(fresh.view.spectators.map((s) => s.playerId)).toEqual([guest.playerId]);
+    // Joining the room again is moving on: the old tab is not told either.
+    expect(guest.reconnect().count('left_room')).toBe(0);
+  });
+
+  it('tells a tab again when the connection it was told on closed before saying anything', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const guest = guests[0] as FakeClient;
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    expect(guest.sent.at(-1)).toEqual(kicked(room.code));
+    guest.disconnect();
+    const back = guest.reconnect();
+    expect(types(back)).toEqual(['left_room', 'welcome']);
+    back.disconnect();
+    const again = back.reconnect();
+    expect(types(again)).toEqual(['left_room', 'welcome']);
+    again.send({ type: 'ping' });
+    expect(pendingKick(hub, guest)).toBeNull();
+    again.disconnect();
+    expect(types(again.reconnect())).toEqual(['welcome']);
+  });
+
+  it('tells a reloaded tab even while the socket it was told on has not closed yet', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const guest = guests[0] as FakeClient;
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    // The page reloads before answering; the new socket says hello before the old one is closed.
+    const reloaded = guest.reconnect();
+    expect(types(reloaded)).toEqual(['left_room', 'welcome']);
+    expect(reloaded.sent[0]).toEqual(kicked(room.code));
+    guest.disconnect();
+    reloaded.send({ type: 'ping' });
+    expect(pendingKick(hub, guest)).toBeNull();
+  });
+
+  it('works for a hello without a tab id, whose connection is taken for no other', () => {
+    const hub = createHub();
+    const { host, room } = table(hub, {}, 0);
+    host.send({ type: 'remove_bot', seat: 1 });
+    // An older client that sends no tab id.
+    const guest = new FakeClient(hub, { name: 'Old', tab: undefined });
+    expect(types(guest)).toEqual(['welcome']);
+    guest.send({ type: 'join_room', code: room.code });
+    guest.send({ type: 'sit', seat: 1 });
+    expect(guest.view.you.seat).toBe(1);
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    expect(guest.sent.at(-1)).toEqual(kicked(room.code));
+    // Another connection without a tab id is not that tab.
+    const other = new FakeClient(hub, {
+      playerId: guest.playerId,
+      token: guest.token,
+      tab: undefined,
+    });
+    expect(types(other)).toEqual(['welcome']);
+    const kick = pendingKick(hub, guest);
+    expect([...(kick?.tabs.values() ?? [])]).toEqual(['told']);
+    expect([...(kick?.tabs.keys() ?? [])][0]).not.toMatch(/^[0-9a-f]{16}$/);
+    guest.send({ type: 'ping' });
+    expect(pendingKick(hub, guest)).toBeNull();
+  });
+
+  it('forgets the kick once every tab that was in the room has answered', () => {
+    const hub = createHub();
+    const { host, guests } = table(hub, {}, 1);
+    const a = guests[0] as FakeClient;
+    const b = a.newTab();
+    const c = a.newTab();
+    host.send({ type: 'start_hand' });
+    c.disconnect();
+    host.send({ type: 'kick', seat: 1 });
+    a.send({ type: 'ping' });
+    b.send({ type: 'ping' });
+    expect(pendingKick(hub, a)).not.toBeNull();
+    expect(pendingKick(hub, a)?.tabs).toEqual(new Map([[c.tab, 'untold']]));
+    const cBack = c.reconnect();
+    expect(types(cBack)).toEqual(['left_room', 'welcome']);
+    expect(pendingKick(hub, a)?.tabs).toEqual(new Map([[c.tab, 'told']]));
+    cBack.send({ type: 'ping' });
+    expect(pendingKick(hub, a)).toBeNull();
+    // Nothing left to tell them: the player is forgotten once their last socket closes.
+    for (const client of [a, b, cBack]) client.disconnect();
+    expect(hub.players.get(a.playerId)).toBeUndefined();
+  });
+
+  it('remembers the 8 tabs of a player that were in the room last', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const first = guests[0] as FakeClient;
+    const tabs = [first];
+    for (let i = 0; i < 9; i++) tabs.push(first.newTab());
+    for (const tab of tabs) tab.disconnect();
+    host.send({ type: 'kick', seat: 1 });
+    expect(room.isMember(first.playerId)).toBe(false);
+    // The two opened first are not told; the last eight are.
+    expect(types((tabs[0] as FakeClient).reconnect())).toEqual(['welcome']);
+    expect(types((tabs[1] as FakeClient).reconnect())).toEqual(['welcome']);
+    expect(types((tabs[2] as FakeClient).reconnect())).toEqual(['left_room', 'welcome']);
+    expect(types((tabs[9] as FakeClient).reconnect())).toEqual(['left_room', 'welcome']);
+    expect([...(pendingKick(hub, first)?.tabs.keys() ?? [])]).toEqual(
+      tabs.slice(2).map((tab) => tab.tab),
+    );
+  });
+
+  it('tells a tab that was away while the player left the room and came back to it', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const a = guests[0] as FakeClient;
+    // A second tab on the room, whose socket closes and stays closed for a while.
+    const b = a.newTab();
+    b.disconnect();
+    // Meanwhile the player leaves the room from the first tab, comes back and sits down again.
+    a.send({ type: 'leave_room' });
+    a.send({ type: 'join_room', code: room.code });
+    a.send({ type: 'sit', seat: 1 });
+    expect(room.seatOf(a.playerId)).toBe(1);
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    a.send({ type: 'ping' });
+    // The second tab never heard it left: it still shows the room and would rejoin it.
+    const bBack = b.reconnect();
+    expect(types(bBack)).toEqual(['left_room', 'welcome']);
+    expect(bBack.sent[0]).toEqual(kicked(room.code));
+    rejoinLikeTheWebClient(bBack, room.code);
+    expect(room.isMember(a.playerId)).toBe(false);
+  });
+
+  it('tells a tab that was away while the player was dropped from the spectators and came back', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const a = guests[0] as FakeClient;
+    const b = a.newTab();
+    a.send({ type: 'stand' });
+    // Both sockets stay closed past the spectator grace: the player is dropped from the room.
+    a.disconnect();
+    b.disconnect();
+    vi.advanceTimersByTime(SPECTATOR_GRACE_MS);
+    expect(room.isMember(a.playerId)).toBe(false);
+    // The first tab comes back, rejoins the room and sits down.
+    const aBack = a.reconnect();
+    aBack.send({ type: 'join_room', code: room.code });
+    aBack.send({ type: 'sit', seat: 1 });
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    aBack.send({ type: 'ping' });
+    const bBack = b.reconnect();
+    expect(types(bBack)).toEqual(['left_room', 'welcome']);
+    expect(bBack.sent[0]).toEqual(kicked(room.code));
+    rejoinLikeTheWebClient(bBack, room.code);
+    expect(room.isMember(a.playerId)).toBe(false);
+  });
+
+  it('tells a tab that was away while the player was kicked, came back and was kicked again', () => {
+    const hub = createHub();
+    const { host, guests, room } = table(hub, {}, 1);
+    const a = guests[0] as FakeClient;
+    const b = a.newTab();
+    b.disconnect();
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    a.send({ type: 'ping' });
+    // The player opens the room link again from the first tab: the first kick is old news.
+    a.send({ type: 'join_room', code: room.code });
+    expect(pendingKick(hub, a)).toBeNull();
+    // After the hand their seat is free again (the bot is removed), they sit down, and the host
+    // kicks them during the next hand.
+    advanceUntil(() => host.view.status === 'between_hands');
+    host.send({ type: 'remove_bot', seat: 1 });
+    a.send({ type: 'sit', seat: 1 });
+    expect(a.lastError).toBeNull();
+    host.send({ type: 'start_hand' });
+    host.send({ type: 'kick', seat: 1 });
+    a.send({ type: 'ping' });
+    const bBack = b.reconnect();
+    expect(types(bBack)).toEqual(['left_room', 'welcome']);
+    rejoinLikeTheWebClient(bBack, room.code);
+    expect(room.isMember(a.playerId)).toBe(false);
+  });
+
+  it('keeps the tabs of the 20 players who left last', () => {
+    const hub = createHub();
+    const { host, room } = table(hub, {}, 0);
+    host.send({ type: 'remove_bot', seat: 1 });
+    // One player more than are kept each join from two tabs, and leave from the first while the
+    // second is away.
+    const visitors = Array.from({ length: FORMER_MEMBERS_KEPT + 1 }, (_, i) => {
+      const a = new FakeClient(hub, { name: `Visitor ${i}` });
+      a.send({ type: 'join_room', code: room.code });
+      const b = a.newTab();
+      b.disconnect();
+      a.send({ type: 'leave_room' });
+      return { a, b };
+    });
+    /** Comes back from the first tab, sits down and is moved to the spectators: told in the second? */
+    const toldInTheOtherTab = (index: number): boolean => {
+      const { a, b } = visitors[index] as { a: FakeClient; b: FakeClient };
+      a.send({ type: 'join_room', code: room.code });
+      a.send({ type: 'sit', seat: 1 });
+      host.send({ type: 'kick', seat: 1 });
+      a.send({ type: 'ping' });
+      return b.reconnect().count('notice') === 1;
+    };
+    expect(toldInTheOtherTab(0)).toBe(false);
+    expect(toldInTheOtherTab(1)).toBe(true);
+    expect(toldInTheOtherTab(FORMER_MEMBERS_KEPT)).toBe(true);
+    expect(host.errors).toEqual([]);
   });
 });

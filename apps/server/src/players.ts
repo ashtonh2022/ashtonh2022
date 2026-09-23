@@ -23,8 +23,8 @@ export interface Player {
   /** Epoch ms of recent chat and emote messages, for rate limiting. */
   readonly chatTimes: number[];
   /**
-   * The host's last kick, until it is sure the player heard about it: it is told again on every
-   * `hello` in the meantime (see Hub). Null when there is nothing to tell.
+   * The host's last kick, until every tab of the player that was in the room has heard about it
+   * (see PendingKick and Hub). Null when there is nothing to tell.
    */
   pendingKick: PendingKick | null;
 }
@@ -36,13 +36,24 @@ export interface Player {
 export type KickOutcome = 'removed' | 'spectators';
 
 /**
- * A kick the player may not have heard about. A socket can look open while nothing reaches the
- * other end (a phone that lost signal, until the heartbeat notices), so sending the message proves
- * nothing. The kick is kept until every connection it was sent to as it happened has said
- * something since, which each could only do over a live link, and until then every `hello` of the
- * player is told. Telling a `hello` proves nothing about the player's other tabs, which each rejoin
- * the room they were in on their own, so it does not end the kick. Joining or creating a room,
- * sitting down again or leaving that room does, and so does PENDING_KICK_TTL_MS.
+ * Where the news of a kick stands in one browser tab (Connection.tab): sent over a connection that
+ * is still open ('told'), or not sent, or sent over one that closed before saying anything since
+ * ('untold': the tab must be told on its next hello).
+ */
+export type TabKickState = 'told' | 'untold';
+
+/**
+ * A kick some tab of the player may not have heard about. Each tab that was in the room as the
+ * player rejoins it on its own when it reconnects (the web client does so after every welcome),
+ * so each must hear about it once: a tab is told as the kick happens when it has a live
+ * connection, otherwise on its next hello. A socket can look open while nothing reaches the other
+ * end (a phone that lost signal, until the heartbeat notices), so sending proves nothing: a tab is
+ * done with only when a connection it was told on says something afterwards (the web client
+ * acknowledges at once with a ping), which it could only do over a live link. A tab that is not in
+ * `tabs` (opened after the kick, or done with already) is never told.
+ *
+ * The kick is forgotten once every tab is done with, when the player joins or creates a room, sits
+ * down again or leaves that room, and after PENDING_KICK_TTL_MS.
  */
 export interface PendingKick {
   /** the room's code */
@@ -50,34 +61,58 @@ export interface PendingKick {
   /** epoch ms of the kick */
   at: number;
   outcome: KickOutcome;
-  /**
-   * Connections it was sent to as it happened that have not said anything since. When the last
-   * of them does, it certainly arrived and is forgotten.
-   */
-  readonly awaiting: Set<Connection>;
-  /** One of `awaiting` closed first, so the kick may never have arrived there: keep it. */
-  lost: boolean;
-  /** Connections it has been sent to (it is not repeated on a second `hello` over one). */
-  readonly heardOn: WeakSet<Connection>;
+  /** Every tab still to hear about the kick or to confirm it did, by tab key. */
+  readonly tabs: Map<string, TabKickState>;
+  /** The connection each 'told' tab was told on: only a message on it confirms the tab. */
+  readonly toldOn: Map<string, Connection>;
 }
 
-/** Records a kick for `player`, about to be sent to each of their current connections. */
+/**
+ * Records a kick for `player` that is about to be sent to each of their current connections:
+ * those tabs are 'told', every other tab in `tabs` (the tabs the room remembers for the player,
+ * see Room.tabsOf) is 'untold'.
+ */
 export function recordKick(
   player: Player,
   code: string,
   at: number,
   outcome: KickOutcome,
+  tabs: Iterable<string> = [],
 ): PendingKick {
-  const kick: PendingKick = {
-    code,
-    at,
-    outcome,
-    awaiting: new Set(player.connections),
-    lost: false,
-    heardOn: new WeakSet(player.connections),
-  };
-  player.pendingKick = kick;
+  const kick: PendingKick = { code, at, outcome, tabs: new Map(), toldOn: new Map() };
+  for (const tab of tabs) kick.tabs.set(tab, 'untold');
+  for (const connection of player.connections) markTold(kick, connection);
+  player.pendingKick = kick.tabs.size > 0 ? kick : null;
   return kick;
+}
+
+/** The kick is being sent to `connection`, for its tab. */
+export function markTold(kick: PendingKick, connection: Connection): void {
+  kick.tabs.set(connection.tab, 'told');
+  kick.toldOn.set(connection.tab, connection);
+}
+
+/**
+ * `connection` said something. If the player's pending kick was sent to it, it got there: its tab
+ * is done with, and the kick is forgotten when that was the last one.
+ */
+export function confirmKick(player: Player, connection: Connection): void {
+  const kick = player.pendingKick;
+  if (kick === null || kick.toldOn.get(connection.tab) !== connection) return;
+  kick.toldOn.delete(connection.tab);
+  kick.tabs.delete(connection.tab);
+  if (kick.tabs.size === 0) player.pendingKick = null;
+}
+
+/**
+ * `connection` closed. If the player's pending kick was sent to it and it said nothing since, the
+ * kick may never have arrived: its tab is told again on its next hello.
+ */
+export function unconfirmKick(player: Player, connection: Connection): void {
+  const kick = player.pendingKick;
+  if (kick === null || kick.toldOn.get(connection.tab) !== connection) return;
+  kick.toldOn.delete(connection.tab);
+  kick.tabs.set(connection.tab, 'untold');
 }
 
 /** Forgets the player's pending kick when it is about room `code`. */

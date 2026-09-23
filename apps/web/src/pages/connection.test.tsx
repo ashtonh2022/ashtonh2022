@@ -35,6 +35,8 @@ import { newHand, resetStore, roomView } from '../test/fixtures';
 
 const sockets: FakeSocket[] = [];
 let storage: MemoryStorage;
+/** Every hello carries the tab id, whatever it is. */
+const anyTab = expect.stringMatching(/^[0-9a-f]{16}$/);
 
 function welcome(name: string, playerId = 'p0'): ServerMessage {
   return { type: 'welcome', playerId, token: 't0', name, protocol: PROTOCOL_VERSION };
@@ -104,7 +106,7 @@ describe('Home: a name typed right after the page loads', () => {
 
     expect(nameInput().value).toBe('Bob');
     expect(socketAt(0).parsed()).toEqual([
-      { type: 'hello', protocol: PROTOCOL_VERSION },
+      { type: 'hello', protocol: PROTOCOL_VERSION, tab: anyTab },
       { type: 'set_name', name: 'Bob' },
     ]);
     expect(stored()).toEqual({ playerId: 'p0', token: 't0', name: 'Bob' });
@@ -150,6 +152,7 @@ describe('Home: a name typed right after the page loads', () => {
       playerId: 'p0',
       token: 't0',
       name: 'Zed',
+      tab: anyTab,
     });
     act(() => socketAt(0).receive(welcome('Zed')));
     expect(nameInput().value).toBe('Zed');
@@ -229,7 +232,8 @@ describe('Room: kicked while away', () => {
     });
     expect(screen.getByRole('alert')).toHaveTextContent('The host removed you from room ABCDEF.');
     expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument();
-    expect(socketAt(0).types()).toEqual(['hello']);
+    // Only the acknowledgement: no join_room.
+    expect(socketAt(0).types()).toEqual(['hello', 'ping']);
   });
 
   it('goes home and says why when the connection comes back, without rejoining', () => {
@@ -248,7 +252,8 @@ describe('Room: kicked while away', () => {
       socketAt(1).receive(welcome('Bo', 'p1'));
     });
     expect(screen.getByRole('alert')).toHaveTextContent('The host removed you from room ABCDEF.');
-    expect(socketAt(1).types()).toEqual(['hello']);
+    // Only the acknowledgement: no join_room.
+    expect(socketAt(1).types()).toEqual(['hello', 'ping']);
   });
 
   it('lets the player open that room again from the home page', () => {

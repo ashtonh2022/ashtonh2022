@@ -1,9 +1,10 @@
 /**
- * Test doubles for GameClient: a WebSocket the test drives by hand and an in-memory storage.
+ * Test doubles for GameClient: a WebSocket and a page the test drives by hand, and an in-memory
+ * storage.
  */
 import type { ServerMessage } from '@landlord/protocol';
 
-import type { SocketLike, StorageLike } from '../net/client';
+import type { PageEvent, PageLike, SocketLike, StorageLike } from '../net/client';
 
 export class FakeSocket implements SocketLike {
   readyState = 0;
@@ -52,5 +53,43 @@ export class MemoryStorage implements StorageLike {
   }
   setItem(key: string, value: string): void {
     this.map.set(key, value);
+  }
+  removeItem(key: string): void {
+    this.map.delete(key);
+  }
+  /** What a tab duplicated now, or opened now with window.open, starts with (sessionStorage). */
+  copy(): MemoryStorage {
+    const copy = new MemoryStorage();
+    for (const [key, value] of this.map) copy.setItem(key, value);
+    return copy;
+  }
+}
+
+/** A browser page whose visibility and lifecycle events the test drives by hand. */
+export class FakePage implements PageLike {
+  hidden: boolean;
+  private readonly listeners = new Map<PageEvent, Array<() => void>>();
+
+  constructor(hidden = false) {
+    this.hidden = hidden;
+  }
+
+  addEventListener(type: PageEvent, listener: () => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  fire(type: PageEvent): void {
+    for (const listener of this.listeners.get(type) ?? []) listener();
+  }
+
+  /** The tab goes to the background (or the phone to another app). */
+  hide(): void {
+    this.hidden = true;
+    this.fire('visibilitychange');
+  }
+
+  show(): void {
+    this.hidden = false;
+    this.fire('visibilitychange');
   }
 }

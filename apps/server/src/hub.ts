@@ -3,7 +3,15 @@ import { PROTOCOL_VERSION, type ClientMessage } from '@landlord/protocol';
 import { secureRandom, systemClock, type Clock, type RandomSource } from './clock';
 import { Connection, HELLO_LIMIT, type ConnectionHandler, type Transport } from './connection';
 import { consoleLogger, type Logger } from './log';
-import { cleanName, PlayerRegistry, type PendingKick, type Player } from './players';
+import {
+  cleanName,
+  confirmKick,
+  markTold,
+  PlayerRegistry,
+  unconfirmKick,
+  type PendingKick,
+  type Player,
+} from './players';
 import type { Room, RoomResult } from './room';
 import { DEFAULT_ROOM_TTL_MS, RoomManager } from './rooms';
 
@@ -122,7 +130,8 @@ export class Hub implements ConnectionHandler {
       connection.error('bad_message', 'send hello first');
       return;
     }
-    this.confirmKick(connection, player);
+    // Anything said after a kick went out on this connection shows it got there.
+    confirmKick(player, connection);
     switch (message.type) {
       case 'ping':
         connection.send({ type: 'pong' });
@@ -267,15 +276,20 @@ export class Hub implements ConnectionHandler {
       connection.terminate(1008, 'unsupported protocol');
       return;
     }
-    if (connection.player !== null) this.detach(connection);
+    if (connection.player !== null) {
+      // A kick told on this connection got there: it spoke again.
+      confirmKick(connection.player, connection);
+      this.detach(connection);
+    }
     const player = this.players.identify(message.playerId, message.token, message.name);
+    connection.tab = message.tab ?? connection.ownTab;
     connection.player = player;
     player.connections.add(connection);
     const kick = this.kickToTell(connection, player);
     // Before the welcome: the web client rejoins its room as soon as it is welcomed, so it must
     // already know it was kicked from that room, or it would walk straight back in.
     if (kick?.outcome === 'removed') {
-      kick.heardOn.add(connection);
+      markTold(kick, connection);
       connection.send({ type: 'left_room', reason: 'kicked', code: kick.code });
     }
     connection.send({
@@ -285,41 +299,43 @@ export class Hub implements ConnectionHandler {
       name: player.name,
       protocol: PROTOCOL_VERSION,
     });
-    // A returning player is put straight back into their room.
-    this.roomOf(player)?.onConnectionChange(player);
+    // A returning player is put straight back into their room, and this tab with them.
+    const room = this.roomOf(player);
+    if (room !== undefined) {
+      room.rememberTabs(player, [connection]);
+      room.onConnectionChange(player);
+    }
     // After the snapshot, as when it happens live: the client already shows them watching.
     if (kick?.outcome === 'spectators') {
-      kick.heardOn.add(connection);
+      markTold(kick, connection);
       connection.send({ type: 'notice', notice: 'moved_to_spectators', code: kick.code });
     }
   }
 
   /**
-   * The kick this connection should be told about on its hello: the player's pending kick, unless
-   * it went out on this connection already. One that is no longer true (they are back in that
-   * room, or seated again) is forgotten instead.
+   * The kick this connection should be told about on its hello: the player's pending kick, when
+   * the connection's tab is one it has not reached yet (see PendingKick). A tab the kick does not
+   * know (opened since, or done with already) is not told. A kick that is no longer true (they
+   * are back in that room, or seated again) is forgotten instead.
    */
   private kickToTell(connection: Connection, player: Player): PendingKick | null {
     const kick = player.pendingKick;
-    if (kick === null || kick.heardOn.has(connection)) return null;
+    if (kick === null) return null;
     const room = this.rooms.get(kick.code);
     const stillTrue =
       kick.outcome === 'removed'
         ? room?.isMember(player.id) !== true
         : room !== undefined && !room.isDestroyed && room.seatOf(player.id) === null;
-    if (stillTrue) return kick;
-    player.pendingKick = null;
-    return null;
-  }
-
-  /**
-   * A connection a kick went out on as it happened spoke again, so the link was alive and the
-   * kick arrived there. Once every such connection has, nobody needs telling any more.
-   */
-  private confirmKick(connection: Connection, player: Player): void {
-    const kick = player.pendingKick;
-    if (kick === null || !kick.awaiting.delete(connection)) return;
-    if (kick.awaiting.size === 0 && !kick.lost) player.pendingKick = null;
+    if (!stillTrue) {
+      player.pendingKick = null;
+      return null;
+    }
+    // Only a tab the kick has not reached on this connection. A tab told on another connection
+    // that is still open is told again: that is likely the page before a reload, about to close.
+    if (!kick.tabs.has(connection.tab) || kick.toldOn.get(connection.tab) === connection) {
+      return null;
+    }
+    return kick;
   }
 
   /** Recent create_room times of an IP key, with those older than the window dropped. */
@@ -356,8 +372,7 @@ export class Hub implements ConnectionHandler {
     connection.player = null;
     player.connections.delete(connection);
     // Closed without a word since the kick went out: it may never have arrived there.
-    const kick = player.pendingKick;
-    if (kick !== null && kick.awaiting.delete(connection)) kick.lost = true;
+    unconfirmKick(player, connection);
     const room = this.roomOf(player);
     if (room !== undefined) {
       room.onConnectionChange(player);

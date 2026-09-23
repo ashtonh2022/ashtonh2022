@@ -11,6 +11,11 @@
  * next hello, and a change made after a hello went out is sent with set_name when the welcome
  * arrives instead of being replaced by the name in the welcome.
  *
+ * Every hello also carries the id of this browser tab (see claimTabId): the server tells each tab
+ * that was in a room about a kick from it once, and a tab is done with once it has said something
+ * after being told. So a kick (left_room, reason 'kicked') or a notice is acknowledged with a ping
+ * at once, rather than whenever the next keepalive goes out.
+ *
  * Everything environment-specific (socket constructor, storage, URL) is injectable for tests.
  */
 import { PROTOCOL_VERSION, type ClientMessage, type ServerMessage } from '@landlord/protocol';
@@ -28,10 +33,24 @@ export interface Identity {
 }
 
 export const IDENTITY_KEY = 'landlord.identity';
+/** sessionStorage key of this tab's id */
+export const TAB_KEY = 'landlord.tab';
+const TAB_ID = /^[0-9a-f]{16}$/;
 
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** The page events claimTabId follows (visibilitychange is the document's). */
+export type PageEvent = 'pagehide' | 'pageshow' | 'visibilitychange';
+
+/** The subset of the browser page (window and document) claimTabId uses, so tests can fake it. */
+export interface PageLike {
+  /** true while the page is not visible (document.visibilityState 'hidden') */
+  readonly hidden: boolean;
+  addEventListener(type: PageEvent, listener: () => void): void;
 }
 
 /** The subset of the WebSocket API the client uses (so tests can pass a fake). */
@@ -49,6 +68,10 @@ export interface ClientOptions {
   url?: string;
   createSocket?: (url: string) => SocketLike;
   storage?: StorageLike | null;
+  /** where the tab id is kept (see claimTabId); sessionStorage by default */
+  tabStorage?: StorageLike | null;
+  /** the page whose visibility and lifecycle claimTabId follows; the browser's by default */
+  page?: PageLike | null;
   onMessage?: (message: ServerMessage) => void;
   onStatus?: (status: ConnectionStatus) => void;
   minBackoffMs?: number;
@@ -91,6 +114,95 @@ function defaultStorage(): StorageLike | null {
   } catch {
     return null;
   }
+}
+
+function defaultTabStorage(): StorageLike | null {
+  try {
+    return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** 16 random lowercase hex characters. */
+function newTabId(): string {
+  const bytes = new Uint8Array(8);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function defaultPage(): PageLike | null {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return null;
+  return {
+    get hidden() {
+      return document.visibilityState === 'hidden';
+    },
+    addEventListener(type, listener) {
+      if (type === 'visibilitychange') document.addEventListener(type, listener);
+      else window.addEventListener(type, listener);
+    },
+  };
+}
+
+/** The tab id kept in `storage`: null when there is none, undefined when it cannot be read. */
+function storedTabId(storage: StorageLike | null): string | null | undefined {
+  if (!storage) return undefined;
+  try {
+    const stored = storage.getItem(TAB_KEY);
+    return stored !== null && TAB_ID.test(stored) ? stored : null;
+  } catch {
+    return undefined;
+  }
+}
+
+/** This page's tab id when the storage cannot keep one (see claimTabId). */
+let pageTabId: string | null = null;
+
+/**
+ * The id of this browser tab, taken by this page. It is kept in `storage` (sessionStorage, which
+ * is per tab and survives reloads) and made on first use. But a tab the browser duplicates, or one
+ * the page opens with window.open, starts with a copy of that storage: two live pages with one id
+ * would be one tab to the server, so when one heard about a kick the other would not be told and
+ * would walk back into the room. So while the page is in view the id is taken out of `storage`,
+ * and a copy made then has no id and makes its own. It is put back whenever the page may go away
+ * without another word: on pagehide (a reload, leaving the page, closing the tab) and while the
+ * page is hidden (a tab in the background may be discarded, and is loaded again when shown), so
+ * the next page of this tab finds it.
+ *
+ * When there is no storage or it throws, an id is kept in memory for the page's lifetime instead.
+ */
+export function claimTabId(storage: StorageLike | null, page: PageLike | null): string {
+  const stored = storedTabId(storage);
+  if (!storage || stored === undefined) {
+    pageTabId ??= newTabId();
+    return pageTabId;
+  }
+  const id = stored ?? newTabId();
+  /** true from pagehide until the page is shown again (the back/forward cache) */
+  let gone = false;
+  const update = (): void => {
+    try {
+      if (gone || !page || page.hidden) storage.setItem(TAB_KEY, id);
+      else storage.removeItem(TAB_KEY);
+    } catch {
+      // storage unavailable: the next page of this tab makes an id of its own
+    }
+  };
+  page?.addEventListener('visibilitychange', update);
+  page?.addEventListener('pagehide', () => {
+    gone = true;
+    update();
+  });
+  page?.addEventListener('pageshow', () => {
+    gone = false;
+    update();
+  });
+  update();
+  return id;
 }
 
 export function loadIdentity(storage: StorageLike | null): Identity {
@@ -141,6 +253,10 @@ export class GameClient {
   private readonly url: string;
   private readonly createSocket: (url: string) => SocketLike;
   private readonly storage: StorageLike | null;
+  private readonly tabStorage: StorageLike | null;
+  private readonly page: PageLike | null;
+  /** this tab's id, taken by the first connect (see claimTabId) */
+  private tabId: string | null = null;
   private readonly onMessage: (message: ServerMessage) => void;
   private readonly onStatus: (status: ConnectionStatus) => void;
   private readonly minBackoffMs: number;
@@ -168,6 +284,8 @@ export class GameClient {
     this.createSocket =
       options.createSocket ?? ((url: string) => new WebSocket(url) as unknown as SocketLike);
     this.storage = options.storage === undefined ? defaultStorage() : options.storage;
+    this.tabStorage = options.tabStorage === undefined ? defaultTabStorage() : options.tabStorage;
+    this.page = options.page === undefined ? defaultPage() : options.page;
     this.onMessage = options.onMessage ?? (() => undefined);
     this.onStatus = options.onStatus ?? (() => undefined);
     this.minBackoffMs = options.minBackoffMs ?? 1000;
@@ -182,6 +300,8 @@ export class GameClient {
     if (this.started && !this.stopped) return;
     this.started = true;
     this.stopped = false;
+    // As early as possible: a copy of the tab made before then would share its id.
+    this.tabId ??= claimTabId(this.tabStorage, this.page);
     this.open();
   }
 
@@ -282,12 +402,14 @@ export class GameClient {
     // Not 'open' yet: until the welcome, clicks on the room would be dropped (see send).
     const { playerId, token, name } = this.identity;
     this.nameChangedSinceHello = false;
+    this.tabId ??= claimTabId(this.tabStorage, this.page);
     const hello: ClientMessage = {
       type: 'hello',
       protocol: PROTOCOL_VERSION,
       ...(playerId ? { playerId } : {}),
       ...(token ? { token } : {}),
       ...(name ? { name } : {}),
+      tab: this.tabId,
     };
     socket.send(JSON.stringify(hello));
     if (this.pingIntervalMs > 0) {
@@ -332,14 +454,16 @@ export class GameClient {
       this.setStatus('open');
       return;
     }
+    const kicked = message.type === 'left_room' && message.reason === 'kicked';
     // Kicked from the room we rejoin on every welcome: stop, or the next welcome walks us back in.
     // (A player kicked while away hears it just before the welcome, see the server's Hub.hello.)
-    if (
-      message.type === 'left_room' &&
-      message.reason === 'kicked' &&
-      (message.code === undefined || message.code === this.roomCode)
-    ) {
+    if (kicked && (message.code === undefined || message.code === this.roomCode)) {
       this.roomCode = null;
+    }
+    // Tell the server it arrived, so this tab is not told again (the server has had our hello by
+    // now, so this may go out before the welcome).
+    if ((kicked || message.type === 'notice') && socket.readyState === SOCKET_OPEN) {
+      socket.send(JSON.stringify({ type: 'ping' }));
     }
     this.onMessage(message);
   }

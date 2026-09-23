@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PROTOCOL_VERSION, type ServerMessage } from '@landlord/protocol';
 
-import { FakeSocket, MemoryStorage } from '../test/fakeSocket';
-import { GameClient, IDENTITY_KEY } from './client';
+import { FakePage, FakeSocket, MemoryStorage } from '../test/fakeSocket';
+import { GameClient, IDENTITY_KEY, TAB_KEY } from './client';
+
+/** Every hello carries the tab id, whatever it is (see 'GameClient: the tab id'). */
+const anyTab = expect.stringMatching(/^[0-9a-f]{16}$/);
 
 const welcome: ServerMessage = {
   type: 'welcome',
@@ -53,7 +56,7 @@ describe('GameClient', () => {
     // the socket is open but the server has not accepted us yet
     expect(client.status).toBe('connecting');
     expect(onStatus).not.toHaveBeenCalled();
-    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION });
+    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION, tab: anyTab });
 
     socket.receive({ type: 'hello' }); // the stub server's greeting is ignored
     socket.receive(welcome);
@@ -122,6 +125,7 @@ describe('GameClient', () => {
       playerId: 'p1',
       token: 't1',
       name: 'Ada',
+      tab: anyTab,
     });
     second.receive(welcome);
     expect(client.status).toBe('open');
@@ -397,12 +401,12 @@ describe('GameClient: the name the player typed wins over the welcome', () => {
   ])('keeps a name typed after the hello went out (%s) and sends it', (_label, waitMs) => {
     const { client, socket } = connected();
     socket.open();
-    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION });
+    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION, tab: anyTab });
     client.setName('Bob');
     vi.advanceTimersByTime(waitMs);
     socket.receive(serverDefault);
     expect(socket.parsed()).toEqual([
-      { type: 'hello', protocol: PROTOCOL_VERSION },
+      { type: 'hello', protocol: PROTOCOL_VERSION, tab: anyTab },
       { type: 'set_name', name: 'Bob' },
     ]);
     expect(client.identity).toEqual({ playerId: 'p1', token: 't1', name: 'Bob' });
@@ -429,7 +433,12 @@ describe('GameClient: the name the player typed wins over the welcome', () => {
     const { client, socket } = connected();
     client.setName('Bob');
     socket.open();
-    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION, name: 'Bob' });
+    expect(socket.parsed()[0]).toEqual({
+      type: 'hello',
+      protocol: PROTOCOL_VERSION,
+      name: 'Bob',
+      tab: anyTab,
+    });
     socket.receive({ ...welcome, name: 'Bob' });
     expect(socket.types()).toEqual(['hello']);
     expect(stored()).toEqual({ playerId: 'p1', token: 't1', name: 'Bob' });
@@ -456,6 +465,7 @@ describe('GameClient: the name the player typed wins over the welcome', () => {
       playerId: 'p1',
       token: 't1',
       name: 'Zed',
+      tab: anyTab,
     });
     socket.receive({ ...welcome, name: 'Zed' });
     expect(socket.types()).toEqual(['hello']);
@@ -521,7 +531,8 @@ describe('GameClient: a room the host kicked the player from is not rejoined', (
     socketAt(0).open();
     socketAt(0).receive({ type: 'left_room', reason: 'kicked', code: 'ABCDEF' });
     socketAt(0).receive(welcome);
-    expect(socketAt(0).types()).toEqual(['hello']);
+    // Only the acknowledgement: no join_room.
+    expect(socketAt(0).types()).toEqual(['hello', 'ping']);
     expect(client.currentRoomCode).toBeNull();
     client.disconnect();
   });
@@ -549,7 +560,220 @@ describe('GameClient: a room the host kicked the player from is not rejoined', (
     socketAt(0).receive({ type: 'left_room', reason: 'left', code: 'ABCDEF' });
     socketAt(0).receive({ type: 'left_room' });
     socketAt(0).receive(welcome);
-    expect(socketAt(0).parsed().slice(1)).toEqual([{ type: 'join_room', code: 'ABCDEF' }]);
+    // The kick from the other room is acknowledged, and this one is rejoined.
+    expect(socketAt(0).parsed().slice(1)).toEqual([
+      { type: 'ping' },
+      { type: 'join_room', code: 'ABCDEF' },
+    ]);
+    client.disconnect();
+  });
+});
+
+describe('GameClient: the tab id', () => {
+  const sockets: FakeSocket[] = [];
+  const createSocket = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    return socket;
+  };
+  const TAB_ID = /^[0-9a-f]{16}$/;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sockets.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function socketAt(index: number): FakeSocket {
+    const socket = sockets[index];
+    if (!socket) throw new Error(`no socket ${index}`);
+    return socket;
+  }
+
+  /** A client for a page of a tab whose sessionStorage is `tabStorage`, connected. */
+  function makeClient(tabStorage: MemoryStorage | null, page = new FakePage()): GameClient {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage: new MemoryStorage(),
+      tabStorage,
+      page,
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    return client;
+  }
+
+  function helloTab(socket: FakeSocket): unknown {
+    const hello = socket.parsed()[0];
+    expect(hello?.['type']).toBe('hello');
+    return hello?.['tab'];
+  }
+
+  it('is made once, sent in every hello and handed to the next page of the tab, reloads included', () => {
+    const session = new MemoryStorage();
+    const page = new FakePage();
+    const client = makeClient(session, page);
+    socketAt(0).open();
+    const tab = helloTab(socketAt(0));
+    expect(tab).toMatch(TAB_ID);
+    socketAt(0).receive(welcome);
+
+    // The socket comes back: same tab.
+    socketAt(0).drop();
+    vi.advanceTimersByTime(1000);
+    socketAt(1).open();
+    expect(helloTab(socketAt(1))).toBe(tab);
+
+    // The page reloads: it leaves the id in sessionStorage for the next page of the tab.
+    page.fire('pagehide');
+    expect(session.getItem(TAB_KEY)).toBe(tab);
+    client.disconnect();
+    const reloaded = makeClient(session);
+    socketAt(2).open();
+    expect(helloTab(socketAt(2))).toBe(tab);
+    reloaded.disconnect();
+
+    // Another tab has a sessionStorage of its own, and so an id of its own.
+    const other = makeClient(new MemoryStorage());
+    socketAt(3).open();
+    expect(helloTab(socketAt(3))).toMatch(TAB_ID);
+    expect(helloTab(socketAt(3))).not.toBe(tab);
+    other.disconnect();
+  });
+
+  it('gives a copy of the tab made while the page is in view an id of its own', () => {
+    const session = new MemoryStorage();
+    // A tab that has been reloaded before: its id is in its sessionStorage.
+    session.setItem(TAB_KEY, '0123456789abcdef');
+    const client = makeClient(session);
+    socketAt(0).open();
+    expect(helloTab(socketAt(0))).toBe('0123456789abcdef');
+
+    // The tab is duplicated, or the page opens itself again with window.open: the new page starts
+    // with a copy of the sessionStorage.
+    const copy = makeClient(session.copy());
+    socketAt(1).open();
+    expect(helloTab(socketAt(1))).toMatch(TAB_ID);
+    expect(helloTab(socketAt(1))).not.toBe('0123456789abcdef');
+
+    // Each keeps its own.
+    socketAt(0).drop();
+    vi.advanceTimersByTime(1000);
+    socketAt(2).open();
+    expect(helloTab(socketAt(2))).toBe('0123456789abcdef');
+    client.disconnect();
+    copy.disconnect();
+  });
+
+  it('leaves the id in sessionStorage while the page is hidden, where it may be discarded', () => {
+    const session = new MemoryStorage();
+    const page = new FakePage();
+    const client = makeClient(session, page);
+    socketAt(0).open();
+    const tab = helloTab(socketAt(0));
+    expect(session.getItem(TAB_KEY)).toBeNull();
+    // In the background the browser may discard the page without a pagehide, and load it again
+    // when the tab is shown.
+    page.hide();
+    expect(session.getItem(TAB_KEY)).toBe(tab);
+    page.show();
+    expect(session.getItem(TAB_KEY)).toBeNull();
+    // Back from the back/forward cache after a pagehide: in view again.
+    page.fire('pagehide');
+    expect(session.getItem(TAB_KEY)).toBe(tab);
+    page.fire('pageshow');
+    expect(session.getItem(TAB_KEY)).toBeNull();
+    client.disconnect();
+
+    // A page loaded in the background (session restore, a tab opened behind this one).
+    const background = makeClient(session, new FakePage(true));
+    expect(session.getItem(TAB_KEY)).toMatch(TAB_ID);
+    background.disconnect();
+  });
+
+  it('keeps one id in memory for the page when sessionStorage throws', () => {
+    const broken = new MemoryStorage();
+    broken.getItem = () => {
+      throw new Error('SecurityError');
+    };
+    broken.setItem = () => {
+      throw new Error('SecurityError');
+    };
+    const client = makeClient(broken);
+    socketAt(0).open();
+    const tab = helloTab(socketAt(0));
+    expect(tab).toMatch(TAB_ID);
+    socketAt(0).drop();
+    vi.advanceTimersByTime(1000);
+    socketAt(1).open();
+    expect(helloTab(socketAt(1))).toBe(tab);
+    client.disconnect();
+  });
+});
+
+describe('GameClient: a kick or a notice is acknowledged at once', () => {
+  const sockets: FakeSocket[] = [];
+  const createSocket = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    return socket;
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sockets.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function connected(): { client: GameClient; socket: FakeSocket } {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage: new MemoryStorage(),
+      tabStorage: new MemoryStorage(),
+      // No keepalive: every ping here is an acknowledgement.
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    const socket = sockets[0];
+    if (!socket) throw new Error('no socket');
+    socket.open();
+    return { client, socket };
+  }
+
+  it('pings when kicked, before or after the welcome', () => {
+    const { client, socket } = connected();
+    // Kicked while away: the server says so before it welcomes us.
+    socket.receive({ type: 'left_room', reason: 'kicked', code: 'ABCDEF' });
+    expect(socket.types()).toEqual(['hello', 'ping']);
+    socket.receive(welcome);
+    client.joinRoom('OTHER1');
+    socket.receive({ type: 'left_room', reason: 'kicked', code: 'OTHER1' });
+    expect(socket.types()).toEqual(['hello', 'ping', 'join_room', 'ping']);
+    client.disconnect();
+  });
+
+  it('pings on a notice', () => {
+    const { client, socket } = connected();
+    socket.receive(welcome);
+    socket.receive({ type: 'notice', notice: 'moved_to_spectators', code: 'ABCDEF' });
+    expect(socket.types()).toEqual(['hello', 'ping']);
+    client.disconnect();
+  });
+
+  it('does not ping on a plain leave', () => {
+    const { client, socket } = connected();
+    socket.receive(welcome);
+    socket.receive({ type: 'left_room', reason: 'left', code: 'ABCDEF' });
+    socket.receive({ type: 'left_room' });
+    expect(socket.types()).toEqual(['hello']);
     client.disconnect();
   });
 });

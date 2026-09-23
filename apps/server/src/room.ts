@@ -28,6 +28,7 @@ import {
 
 import { botDelay, botPlayerId, pickBotName } from './bots';
 import type { Clock, RandomSource, TimerHandle } from './clock';
+import type { Connection } from './connection';
 import type { Logger } from './log';
 import { forgetKick, recordKick, type Player, type PlayerRegistry } from './players';
 
@@ -42,6 +43,10 @@ export const ROOM_MEMBER_MAX = 20;
 export const HOST_GRACE_MS = 15_000;
 /** How long a disconnected spectator stays in the room (so a page refresh keeps their place). */
 export const SPECTATOR_GRACE_MS = 60_000;
+/** Browser tabs remembered per member (see Room.tabsOf); the least recently seen go first. */
+export const TABS_PER_MEMBER = 8;
+/** Players no longer in the room whose tabs it keeps (see tabsOf); those who left first go first. */
+export const FORMER_MEMBERS_KEPT = 20;
 
 export interface Seat {
   /** Human occupying the seat; null when empty or when a bot sits here. */
@@ -172,6 +177,10 @@ export class Room {
   private hostVacant = false;
   /** Disconnected spectators, each with the timer that drops them from the room. */
   private readonly spectatorTimers = new Map<string, TimerHandle>();
+  /** Tab keys by member id, least recently seen first (see tabsOf). */
+  private readonly memberTabs = new Map<string, string[]>();
+  /** The same for players no longer in the room, who left last at the end (see retireTabs). */
+  private readonly formerTabs = new Map<string, string[]>();
   private destroyed = false;
 
   constructor(
@@ -188,6 +197,7 @@ export class Room {
     // The creator sits down at seat 0 right away; they can stand up if they only want to watch.
     (this.seats[0] as Seat).playerId = host.id;
     host.roomCode = code;
+    this.rememberTabs(host);
     this.touch();
   }
 
@@ -248,15 +258,61 @@ export class Room {
       player.pendingKick = null;
     }
     player.roomCode = this.code;
+    this.rememberTabs(player);
     this.broadcast();
     return null;
+  }
+
+  /**
+   * The browser tabs (Connection.tab) that have been in the room as a member, least recently seen
+   * first: every connection the member had when they created or joined the room, and every one
+   * that said hello while they were in it (the hub puts it straight back in). Each of them rejoins
+   * the room when it reconnects, so a kick must reach each (see PendingKick). At most
+   * TABS_PER_MEMBER. They are kept when the member leaves the room (see retireTabs) and are theirs
+   * again when they come back.
+   */
+  tabsOf(playerId: string): readonly string[] {
+    return this.memberTabs.get(playerId) ?? [];
+  }
+
+  /** Remembers `connections` of a member (all of theirs by default) as tabs in the room. */
+  rememberTabs(player: Player, connections: Iterable<Connection> = player.connections): void {
+    if (this.destroyed || !this.isMember(player.id)) return;
+    const tabs = this.memberTabs.get(player.id) ?? this.formerTabs.get(player.id) ?? [];
+    this.formerTabs.delete(player.id);
+    for (const connection of connections) {
+      const index = tabs.indexOf(connection.tab);
+      if (index !== -1) tabs.splice(index, 1);
+      tabs.push(connection.tab);
+    }
+    if (tabs.length > TABS_PER_MEMBER) tabs.splice(0, tabs.length - TABS_PER_MEMBER);
+    this.memberTabs.set(player.id, tabs);
+  }
+
+  /**
+   * A member is no longer in the room (they left, were kicked or dropped): their tabs are kept for
+   * when they come back. A tab whose socket was closed meanwhile never heard they left, so it still
+   * shows the room and rejoins it when it reconnects, and a later kick must reach it too. Only the
+   * FORMER_MEMBERS_KEPT players who left last are kept.
+   */
+  private retireTabs(playerId: string): void {
+    const tabs = this.memberTabs.get(playerId);
+    this.memberTabs.delete(playerId);
+    if (tabs === undefined) return;
+    this.formerTabs.delete(playerId);
+    this.formerTabs.set(playerId, tabs);
+    for (const id of this.formerTabs.keys()) {
+      if (this.formerTabs.size <= FORMER_MEMBERS_KEPT) break;
+      this.formerTabs.delete(id);
+    }
   }
 
   /**
    * A player leaves for good: `left` for leave_room or joining another room, `kicked` when the
    * host removed them. During a hand their seat is handed to a bot for the rest of the room's
    * life; otherwise it is simply freed. Their connections get `left_room` with the reason; a kick
-   * is also kept until it surely arrived, for their next `hello` (Player.pendingKick).
+   * is also kept until every tab they had in the room surely heard about it, for the hello of any
+   * that has not (Player.pendingKick).
    */
   leave(player: Player, reason: LeaveReason = 'left'): void {
     const seat = this.seatOf(player.id);
@@ -271,8 +327,10 @@ export class Room {
     }
     this.spectators = this.spectators.filter((id) => id !== player.id);
     if (player.roomCode === this.code) player.roomCode = null;
-    if (reason === 'kicked') recordKick(player, this.code, this.deps.clock.now(), 'removed');
+    const now = this.deps.clock.now();
+    if (reason === 'kicked') recordKick(player, this.code, now, 'removed', this.tabsOf(player.id));
     else forgetKick(player, this.code);
+    this.retireTabs(player.id);
     this.sendTo(player, { type: 'left_room', reason, code: this.code });
     // The host role moves on in broadcast() (syncHost) now that they are no longer a member.
     if (handedToBot) this.armTimers();
@@ -296,6 +354,8 @@ export class Room {
     this.clearHostTimer();
     for (const handle of this.spectatorTimers.values()) this.deps.clock.clearTimeout(handle);
     this.spectatorTimers.clear();
+    this.memberTabs.clear();
+    this.formerTabs.clear();
     for (const player of this.humans()) {
       if (player.roomCode === this.code) player.roomCode = null;
     }
@@ -374,8 +434,8 @@ export class Room {
    * Host removes whoever is at a seat. A bot is removed (lobby only). A human becomes a spectator
    * in the lobby or between hands and is told so with a `moved_to_spectators` notice; during a
    * hand they leave the room (`left_room`, reason `kicked`) and a bot takes the seat. A human who
-   * is not connected leaves the room whatever the status. Either way the kick is kept until it
-   * surely arrived, and a player who has not heard about it is told when they return.
+   * is not connected leaves the room whatever the status. Either way the kick is kept until every
+   * tab they had in the room surely heard about it, and a tab that has not is told when it returns.
    */
   kick(player: Player, seatIndex: number): RoomResult {
     const notHost = this.requireHost(player);
@@ -391,6 +451,7 @@ export class Room {
         this.leave(target, 'kicked');
       } else {
         // A player the registry has forgotten: treat the seat as abandoned.
+        this.retireTabs(seat.playerId);
         if (this.status === 'playing') {
           this.convertSeatToBot(seatIndex);
           this.armTimers();
@@ -405,7 +466,7 @@ export class Room {
     this.spectators.push(target.id);
     this.broadcast();
     // After the snapshot, so the client already shows them among the spectators.
-    recordKick(target, this.code, this.deps.clock.now(), 'spectators');
+    recordKick(target, this.code, this.deps.clock.now(), 'spectators', this.tabsOf(target.id));
     this.sendTo(target, { type: 'notice', notice: 'moved_to_spectators', code: this.code });
     return null;
   }
@@ -904,6 +965,7 @@ export class Room {
       const player = this.deps.players.get(id);
       if (player !== undefined && player.connections.size > 0) return;
       this.spectators = this.spectators.filter((other) => other !== id);
+      this.retireTabs(id);
       if (player !== undefined && player.roomCode === this.code) player.roomCode = null;
       this.broadcast();
       this.deps.onMemberDropped?.(this);

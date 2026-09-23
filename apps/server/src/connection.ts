@@ -42,6 +42,11 @@ let nextConnectionId = 1;
 export class Connection {
   readonly id = nextConnectionId++;
   player: Player | null = null;
+  /**
+   * The browser tab this connection speaks for: the `tab` of its hello, or `ownTab` when the hello
+   * had none (see Hub.hello). Kicks are tracked by tab (PendingKick).
+   */
+  tab = this.ownTab;
   /** `hello` messages received so far. */
   helloCount = 0;
   private readonly recent: number[] = [];
@@ -63,6 +68,14 @@ export class Connection {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  /**
+   * A tab key for this connection alone, for a hello without a tab id: it is not 16 hex
+   * characters, so it matches no tab id and no other connection's key.
+   */
+  get ownTab(): string {
+    return `connection-${this.id}`;
   }
 
   send(message: ServerMessage): void {
