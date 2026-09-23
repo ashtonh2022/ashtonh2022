@@ -14,6 +14,8 @@
  *   'left' yourself) and which room it was. Absent means 'left'.
  * - notice: one-off information for you alone, e.g. the host moved you from your seat to the
  *   spectators in the lobby.
+ * - hello.tab: a random id per browser tab (16 hex characters, kept in sessionStorage so it
+ *   survives reloads). The server uses it to tell each tab about a kick exactly once.
  */
 import { z } from 'zod';
 import type { HandAction, HandResult, HandView, RuleSettings } from '@landlord/engine';
@@ -59,6 +61,11 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
     token: z.string().max(128).optional(),
     name: z.string().max(NAME_MAX).optional(),
     protocol: z.number().int(),
+    /** Random id of this browser tab, kept across reloads of the tab (sessionStorage). */
+    tab: z
+      .string()
+      .regex(/^[0-9a-f]{16}$/)
+      .optional(),
   }),
   z.object({ type: z.literal('set_name'), name: z.string().min(1).max(NAME_MAX) }),
   z.object({ type: z.literal('create_room'), rules: ruleSettingsSchema }),
