@@ -1,6 +1,7 @@
 import { ENGINE_VERSION } from '@landlord/engine';
 import { PROTOCOL_VERSION } from '@landlord/protocol';
 
+import { DEFAULT_MAX_ROOMS } from './hub';
 import { consoleLogger } from './log';
 import { startServer } from './server';
 
@@ -15,17 +16,18 @@ const log = consoleLogger;
 const port = envNumber('PORT', 8080);
 const host = process.env.HOST?.trim() || '0.0.0.0';
 const roomTtlMinutes = envNumber('ROOM_TTL_MINUTES', 120);
+const maxRooms = envNumber('MAX_ROOMS', DEFAULT_MAX_ROOMS);
 
 process.on('unhandledRejection', (reason) => {
   log.error('unhandled rejection', reason);
 });
 
-startServer({ port, host, roomTtlMinutes, log })
+startServer({ port, host, roomTtlMinutes, maxRooms, log })
   .then((server) => {
     log.info(
       `landlord server listening on http://${server.host}:${server.port} ` +
         `(engine ${ENGINE_VERSION}, protocol v${PROTOCOL_VERSION}, ` +
-        `room ttl ${roomTtlMinutes} min, static: ${server.webDist})`,
+        `room ttl ${roomTtlMinutes} min, max rooms ${maxRooms}, static: ${server.webDist})`,
     );
     let stopping = false;
     const shutdown = (signal: string): void => {

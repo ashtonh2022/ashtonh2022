@@ -185,6 +185,116 @@ describe('GameClient', () => {
     client.disconnect();
   });
 
+  it('never replays a hand_action clicked while the socket was down (W4)', () => {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage,
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    const first = sockets[0];
+    if (!first) throw new Error('no socket');
+    first.open();
+    first.receive(welcome);
+    client.joinRoom('ABC123');
+
+    first.drop();
+    expect(client.status).toBe('reconnecting');
+    // the table still shows the last snapshot; the player clicks Pass and sends a chat line
+    expect(client.send({ type: 'hand_action', action: { type: 'pass' } })).toBe(false);
+    expect(client.send({ type: 'chat', text: 'brb' })).toBe(false);
+
+    vi.advanceTimersByTime(1000);
+    const second = sockets[1];
+    if (!second) throw new Error('no second socket');
+    second.open();
+    second.receive(welcome);
+    expect(second.parsed().map((m) => m['type'])).toEqual(['hello', 'join_room', 'chat']);
+    client.disconnect();
+  });
+
+  it('drops hand_actions still queued when the connection closes (W4)', () => {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage,
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    const first = sockets[0];
+    if (!first) throw new Error('no socket');
+    first.open();
+    // opened but not welcomed yet: nothing may be sent for the game
+    client.send({ type: 'hand_action', action: { type: 'pass_bid' } });
+    first.drop();
+    vi.advanceTimersByTime(1000);
+    const second = sockets[1];
+    if (!second) throw new Error('no second socket');
+    second.open();
+    second.receive(welcome);
+    expect(second.parsed().map((m) => m['type'])).toEqual(['hello']);
+    client.disconnect();
+  });
+
+  it('never replays a seat or host action clicked while the socket was down', () => {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage,
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    const first = sockets[0];
+    if (!first) throw new Error('no socket');
+    first.open();
+    first.receive(welcome);
+    client.joinRoom('ABC123');
+
+    first.drop();
+    // These act on the room as the player last saw it: by the time the socket is back, seat 1 may
+    // hold somebody else and the host's hand may already have started.
+    const stale = [
+      { type: 'kick', seat: 1 },
+      { type: 'remove_bot', seat: 2 },
+      { type: 'add_bot', seat: 2 },
+      { type: 'fill_bots' },
+      { type: 'start_hand' },
+      { type: 'sit', seat: 1 },
+      { type: 'stand' },
+      { type: 'update_rules', rules: { turnSeconds: 10 } },
+    ] as const;
+    for (const message of stale) expect(client.send(message)).toBe(false);
+    expect(client.send({ type: 'leave_room' })).toBe(false);
+
+    vi.advanceTimersByTime(1000);
+    const second = sockets[1];
+    if (!second) throw new Error('no second socket');
+    second.open();
+    second.receive(welcome);
+    expect(second.parsed().map((m) => m['type'])).toEqual(['hello', 'join_room', 'leave_room']);
+    client.disconnect();
+  });
+
+  it('still queues a room to create until the first welcome', () => {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage,
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    expect(client.send({ type: 'ping' })).toBe(false);
+    expect(client.send({ type: 'create_room', rules: {} })).toBe(false);
+    expect(client.send({ type: 'start_hand' })).toBe(false);
+    const socket = sockets[0];
+    if (!socket) throw new Error('no socket');
+    socket.open();
+    socket.receive(welcome);
+    expect(socket.parsed().map((m) => m['type'])).toEqual(['hello', 'ping', 'create_room']);
+    client.disconnect();
+  });
+
   it('loads a persisted identity and setName persists the name', () => {
     storage.setItem(IDENTITY_KEY, JSON.stringify({ playerId: 'p9', token: 't9', name: 'Zed' }));
     const client = new GameClient({

@@ -2,8 +2,8 @@ import type { HandResult } from '@landlord/engine';
 import type { RoomView } from '@landlord/protocol';
 
 import { fmt } from '../lib/format';
-import { seatName } from '../lib/seats';
 import { send } from '../net/session';
+import { useStore } from '../store';
 import { strings } from '../strings';
 
 interface ResultPanelProps {
@@ -17,14 +17,46 @@ function points(n: number): string {
   return n >= 0 ? fmt(strings.pointsPlus, { n }) : fmt(strings.pointsMinus, { n: Math.abs(n) });
 }
 
+interface ResultRow {
+  seat: number;
+  playerId: string | null;
+  name: string;
+  score: number;
+}
+
+/**
+ * Who each seat's result belongs to: the players who were dealt the hand. They may have left or
+ * changed seats since, so the seats as they are now only stand in for a server that does not say.
+ */
+function resultRows(room: RoomView): ResultRow[] {
+  if (room.resultSeats && room.resultSeats.length > 0) {
+    return room.resultSeats.map(({ seat, playerId, name, score }) => ({
+      seat,
+      playerId,
+      name,
+      score,
+    }));
+  }
+  return room.seats.map((seat) => ({
+    seat: seat.seat,
+    playerId: seat.playerId,
+    name: seat.name ?? strings.emptySeat,
+    score: seat.score,
+  }));
+}
+
 export function ResultPanel({ room, result, showControls }: ResultPanelProps) {
-  const mySeat = room.you.seat;
+  const online = useStore((state) => state.status === 'open');
+  const rows = resultRows(room);
+  const nameAt = (seat: number) => rows.find((row) => row.seat === seat)?.name ?? '?';
+  // "You" are whoever was dealt a seat in this hand, wherever you sit now.
+  const mySeat = rows.find((row) => row.playerId === room.you.playerId)?.seat ?? null;
   const iAmLandlord = mySeat !== null && mySeat === result.landlord;
   const landlordWon = result.winnerSide === 'landlord';
   const iWon = mySeat === null ? null : landlordWon === iAmLandlord;
   const handNumber = room.hand?.handNumber ?? room.handNumber;
   const doublers = result.doubled
-    .map((doubled, seat) => (doubled ? seatName(room, seat) : null))
+    .map((doubled, seat) => (doubled ? nameAt(seat) : null))
     .filter((name): name is string => name !== null);
 
   const lines: Array<{ label: string; value: string }> = [
@@ -72,7 +104,7 @@ export function ResultPanel({ room, result, showControls }: ResultPanelProps) {
           <span className="result-you">{iWon ? strings.youWin : strings.youLose}</span>
         )}
       </p>
-      <p className="muted">{fmt(strings.wentOut, { name: seatName(room, result.winnerSeat) })}</p>
+      <p className="muted">{fmt(strings.wentOut, { name: nameAt(result.winnerSeat) })}</p>
 
       <dl className="breakdown">
         {lines.map((line) => (
@@ -89,25 +121,25 @@ export function ResultPanel({ room, result, showControls }: ResultPanelProps) {
 
       <table className="score-table">
         <tbody>
-          {room.seats.map((seat) => (
-            <tr key={seat.seat}>
+          {rows.map((row) => (
+            <tr key={row.seat}>
               <td className="score-name">
-                {seat.name ?? strings.emptySeat}
-                {seat.seat === result.landlord && (
+                {row.name}
+                {row.seat === result.landlord && (
                   <span className="tag tag-landlord">{strings.landlord}</span>
                 )}
-                {result.doubled[seat.seat] && (
+                {result.doubled[row.seat] && (
                   <span className="tag tag-double">{strings.doubledBadge}</span>
                 )}
               </td>
               <td
                 className={
-                  (result.amounts[seat.seat] ?? 0) < 0 ? 'score-value negative' : 'score-value'
+                  (result.amounts[row.seat] ?? 0) < 0 ? 'score-value negative' : 'score-value'
                 }
               >
-                {points(result.amounts[seat.seat] ?? 0)}
+                {points(result.amounts[row.seat] ?? 0)}
               </td>
-              <td className="score-running muted">{seat.score}</td>
+              <td className="score-running muted">{row.score}</td>
             </tr>
           ))}
         </tbody>
@@ -120,7 +152,7 @@ export function ResultPanel({ room, result, showControls }: ResultPanelProps) {
             <button
               type="button"
               className="button button-primary button-block"
-              disabled={!room.seats.every((seat) => seat.playerId !== null)}
+              disabled={!online || !room.seats.every((seat) => seat.playerId !== null)}
               onClick={() => send({ type: 'start_hand' })}
             >
               {strings.nextHand}

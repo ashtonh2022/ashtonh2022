@@ -39,7 +39,11 @@ export class RoomManager {
   }
 
   create(host: Player, rulesInput: unknown): Room {
-    const room = new Room(this.newCode(), host, rulesInput, this.deps);
+    const room = new Room(this.newCode(), host, rulesInput, {
+      ...this.deps,
+      // A grace period that runs out may take the last human with it.
+      onMemberDropped: (dropped) => this.deleteIfAbandoned(dropped),
+    });
     this.rooms.set(room.code, room);
     this.deps.log.info(`room ${room.code}: created by ${host.name} (${host.id})`);
     return room;
@@ -53,10 +57,51 @@ export class RoomManager {
   delete(code: string): boolean {
     const room = this.rooms.get(normalizeCode(code));
     if (room === undefined) return false;
+    const members = room.humans();
     this.rooms.delete(room.code);
     room.destroy();
+    // Members nobody is connected as are not needed any more (their tokens bring them back).
+    for (const player of members) this.deps.players.release(player);
     this.deps.log.info(`room ${room.code}: deleted`);
     return true;
+  }
+
+  /** Whether a room can be created under `max`, if need be by closing one (see makeSpace). */
+  hasSpace(max: number): boolean {
+    return this.rooms.size < max || this.idlest() !== undefined;
+  }
+
+  /**
+   * Brings the count under `max` by closing the rooms nobody has been connected to for longest.
+   * Rooms somebody is connected to are never closed; false when that is all that is left.
+   */
+  makeSpace(max: number): boolean {
+    while (this.rooms.size >= max) {
+      const room = this.idlest();
+      if (room === undefined) return false;
+      this.deps.log.info(`room ${room.code}: closed to make space, nobody is connected to it`);
+      this.delete(room.code);
+    }
+    return true;
+  }
+
+  /** The room with no connected human for the longest time; undefined when there is none. */
+  private idlest(): Room | undefined {
+    let idlest: Room | undefined;
+    for (const room of this.rooms.values()) {
+      room.touch();
+      if (room.emptySince === null) continue;
+      if (idlest === undefined || room.emptySince < (idlest.emptySince as number)) idlest = room;
+    }
+    return idlest;
+  }
+
+  /** A room with no humans left in it (seated or watching) has nobody to come back to it. */
+  deleteIfAbandoned(room: Room): boolean {
+    if (room.isDestroyed || room.humanCount() > 0 || this.rooms.get(room.code) !== room) {
+      return false;
+    }
+    return this.delete(room.code);
   }
 
   /** Deletes rooms nobody is in, or that no human has been connected to for the TTL. */

@@ -2,7 +2,9 @@
  * The one WebSocket to the game server. Sends `hello` on every open with the identity persisted
  * in localStorage, persists what `welcome` returns, reconnects with backoff (1 s doubling up to
  * 10 s) and re-joins the current room after a reconnect. Messages sent before the server has
- * welcomed us are queued and flushed right after.
+ * welcomed us are queued and flushed right after, except actions on the room itself (see
+ * LIVE_ONLY): a click made against a table that may be out of date is dropped rather than
+ * replayed later.
  *
  * Everything environment-specific (socket constructor, storage, URL) is injectable for tests.
  */
@@ -47,6 +49,24 @@ export interface ClientOptions {
 
 const SOCKET_OPEN = 1;
 const MAX_QUEUE = 20;
+
+/**
+ * Messages aimed at the room as the player last saw it: a seat by its index, the hand on the table,
+ * the host starting the next hand. They are sent while connected or not at all. After a reconnect
+ * the room may have moved on (somebody else in that seat, a hand already under way), so a replay
+ * could kick the wrong person or play into another trick.
+ */
+const LIVE_ONLY: ReadonlySet<ClientMessage['type']> = new Set<ClientMessage['type']>([
+  'hand_action',
+  'sit',
+  'stand',
+  'add_bot',
+  'remove_bot',
+  'fill_bots',
+  'kick',
+  'start_hand',
+  'update_rules',
+]);
 
 export function defaultSocketUrl(): string {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -167,13 +187,15 @@ export class GameClient {
 
   /**
    * Sends a message, or queues it until the server has welcomed us. Returns true when the message
-   * went out immediately.
+   * went out immediately. LIVE_ONLY messages are never queued: they were aimed at the room the
+   * player saw, and after a reconnect it may be somewhere else entirely.
    */
   send(message: ClientMessage): boolean {
     if (this.socket && this.socket.readyState === SOCKET_OPEN && this.welcomed) {
       this.socket.send(JSON.stringify(message));
       return true;
     }
+    if (LIVE_ONLY.has(message.type)) return false;
     if (this.queue.length >= MAX_QUEUE) this.queue.shift();
     this.queue.push(message);
     return false;
@@ -270,6 +292,7 @@ export class GameClient {
     if (socket !== this.socket) return;
     this.socket = null;
     this.welcomed = false;
+    this.queue = this.queue.filter((message) => !LIVE_ONLY.has(message.type));
     this.clearTimers();
     if (this.stopped) return;
     this.setStatus(this.everOpened ? 'reconnecting' : 'connecting');

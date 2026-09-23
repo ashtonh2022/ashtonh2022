@@ -39,6 +39,8 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
   const setSelection = useStore((state) => state.setSelection);
   const clearSelection = useStore((state) => state.clearSelection);
   const setHintIndex = useStore((state) => state.setHintIndex);
+  // While the socket is down the table may be out of date: nothing is sent from it.
+  const online = useStore((state) => state.status === 'open');
   const [noHint, setNoHint] = useState(false);
   const cycleCache = useRef<{ key: string; plays: Combo[] } | null>(null);
 
@@ -46,7 +48,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
   const rules = hand.rules;
   const current = hand.trick.current;
   const myTurn = hand.phase === 'playing' && legal.canPlay;
-  const acting = seatIsActing(hand, mySeat);
+  const acting = seatIsActing(room, hand, mySeat);
   const isLandlord = hand.landlord === mySeat;
 
   const selectedCards = useMemo(
@@ -74,6 +76,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
   }, [left, acting, room.deadline]);
 
   const showHint = () => {
+    if (!online) return;
     const key = cycleKey(hand.hand, current);
     if (!cycleCache.current || cycleCache.current.key !== key) {
       cycleCache.current = { key, plays: hintCycle(hand.hand, current, rules) };
@@ -92,14 +95,16 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
   };
 
   const playSelection = () => {
-    if (!preview.legal || !preview.combo) return;
+    if (!online || !preview.legal || !preview.combo) return;
     send({
       type: 'hand_action',
       action: { type: 'play', cardIds: preview.combo.cards.map((c) => c.id) },
     });
   };
 
-  const act = (action: HandAction) => send({ type: 'hand_action', action });
+  const act = (action: HandAction) => {
+    if (online) send({ type: 'hand_action', action });
+  };
 
   const statusText = (() => {
     if (hand.phase === 'doubling') {
@@ -174,7 +179,12 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
         {hand.phase === 'bidding' && hand.turn === mySeat && (
           <>
             {legal.canPassBid && (
-              <button type="button" className="button" onClick={() => act({ type: 'pass_bid' })}>
+              <button
+                type="button"
+                className="button"
+                disabled={!online}
+                onClick={() => act({ type: 'pass_bid' })}
+              >
                 {strings.pass}
               </button>
             )}
@@ -182,6 +192,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
               <button
                 type="button"
                 className="button button-primary"
+                disabled={!online}
                 onClick={() => act({ type: 'call' })}
               >
                 {strings.call}
@@ -191,6 +202,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
               <button
                 type="button"
                 className="button button-primary"
+                disabled={!online}
                 onClick={() => act({ type: 'rob' })}
               >
                 {strings.rob}
@@ -201,6 +213,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
                 key={value}
                 type="button"
                 className="button button-primary"
+                disabled={!online}
                 onClick={() => act({ type: 'bid', value })}
               >
                 {fmt(strings.bidValue, { value })}
@@ -214,6 +227,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
             <button
               type="button"
               className="button"
+              disabled={!online}
               onClick={() => act({ type: 'double', double: false })}
             >
               {strings.keep}
@@ -221,6 +235,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
             <button
               type="button"
               className="button button-primary"
+              disabled={!online}
               onClick={() => act({ type: 'double', double: true })}
             >
               {strings.double}
@@ -233,12 +248,12 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
             <button
               type="button"
               className="button"
-              disabled={!legal.canPass}
+              disabled={!online || !legal.canPass}
               onClick={() => act({ type: 'pass' })}
             >
               {strings.pass}
             </button>
-            <button type="button" className="button" onClick={showHint}>
+            <button type="button" className="button" disabled={!online} onClick={showHint}>
               {strings.hint}
             </button>
             <button
@@ -252,7 +267,7 @@ export function HandArea({ room, hand, now }: HandAreaProps) {
             <button
               type="button"
               className="button button-primary"
-              disabled={!preview.legal}
+              disabled={!online || !preview.legal}
               onClick={playSelection}
             >
               {strings.play}

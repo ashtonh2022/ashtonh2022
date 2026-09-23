@@ -19,6 +19,8 @@ function SeatCard({ room, seat }: { room: RoomView; seat: SeatView }) {
   const seated = room.you.seat !== null;
   const empty = seat.playerId === null;
   const canEdit = room.status === 'lobby' || room.status === 'between_hands';
+  // While the socket is down these would act on a room that may have changed: they are not sent.
+  const online = useStore((state) => state.status === 'open');
 
   return (
     <li className={`seat-card${empty ? ' seat-empty' : ''}${isYou ? ' seat-you' : ''}`}>
@@ -42,6 +44,7 @@ function SeatCard({ room, seat }: { room: RoomView; seat: SeatView }) {
             <button
               type="button"
               className="button button-small button-primary"
+              disabled={!online}
               onClick={() => send({ type: 'sit', seat: seat.seat })}
             >
               {strings.sitHere}
@@ -51,6 +54,7 @@ function SeatCard({ room, seat }: { room: RoomView; seat: SeatView }) {
             <button
               type="button"
               className="button button-small"
+              disabled={!online}
               onClick={() => send({ type: 'add_bot', seat: seat.seat })}
             >
               {strings.addBot}
@@ -60,6 +64,7 @@ function SeatCard({ room, seat }: { room: RoomView; seat: SeatView }) {
             <button
               type="button"
               className="button button-small"
+              disabled={!online}
               onClick={() => send({ type: 'stand' })}
             >
               {strings.standUp}
@@ -69,6 +74,7 @@ function SeatCard({ room, seat }: { room: RoomView; seat: SeatView }) {
             <button
               type="button"
               className="button button-small"
+              disabled={!online}
               onClick={() => send({ type: 'remove_bot', seat: seat.seat })}
             >
               {strings.removeBot}
@@ -78,6 +84,7 @@ function SeatCard({ room, seat }: { room: RoomView; seat: SeatView }) {
             <button
               type="button"
               className="button button-small button-danger"
+              disabled={!online}
               onClick={() => send({ type: 'kick', seat: seat.seat })}
             >
               {strings.kick}
@@ -97,6 +104,7 @@ export function Lobby({ room }: { room: RoomView }) {
   const anyEmpty = !allFilled;
   const showResult = room.status === 'between_hands' && room.lastResult !== null;
   const you = useStore((state) => state.you);
+  const online = useStore((state) => state.status === 'open');
 
   const startEditing = () => {
     setDraft(room.rules);
@@ -131,7 +139,12 @@ export function Lobby({ room }: { room: RoomView }) {
         </ul>
         {isHost && anyEmpty && (
           <div className="button-row">
-            <button type="button" className="button" onClick={() => send({ type: 'fill_bots' })}>
+            <button
+              type="button"
+              className="button"
+              disabled={!online}
+              onClick={() => send({ type: 'fill_bots' })}
+            >
               {strings.fillWithBots}
             </button>
           </div>
@@ -143,7 +156,7 @@ export function Lobby({ room }: { room: RoomView }) {
               <button
                 type="button"
                 className="button button-primary button-block"
-                disabled={!allFilled}
+                disabled={!allFilled || !online}
                 onClick={() => send({ type: 'start_hand' })}
               >
                 {room.status === 'between_hands' ? strings.nextHand : strings.startHand}
@@ -166,7 +179,12 @@ export function Lobby({ room }: { room: RoomView }) {
           <>
             <RuleOptions value={draft} onChange={setDraft} />
             <div className="button-row">
-              <button type="button" className="button button-primary" onClick={saveRules}>
+              <button
+                type="button"
+                className="button button-primary"
+                disabled={!online}
+                onClick={saveRules}
+              >
                 {strings.saveOptions}
               </button>
               <button type="button" className="button" onClick={() => setEditing(false)}>
@@ -197,13 +215,14 @@ export function Lobby({ room }: { room: RoomView }) {
         {room.spectators.length === 0 ? (
           <p className="muted">{strings.noSpectators}</p>
         ) : (
-          <ul className="spectator-list">
+          <ul className="spectator-list" aria-label={strings.spectatorsTitle}>
             {room.spectators.map((spectator) => (
               <li key={spectator.playerId}>
                 {spectator.name}
                 {spectator.playerId === you?.playerId && (
                   <span className="tag tag-you">{strings.you}</span>
                 )}
+                <EmoteBubble seat={null} playerId={spectator.playerId} inline />
               </li>
             ))}
           </ul>

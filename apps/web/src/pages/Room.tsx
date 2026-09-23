@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 
 import { ChatPanel } from '../components/Chat';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Lobby } from '../components/Lobby';
 import { StatusBanner, Toast } from '../components/Notices';
 import { Table } from '../components/Table';
@@ -12,18 +13,42 @@ import { useStore } from '../store';
 import { strings } from '../strings';
 import { normalizeCode } from './Home';
 
+let mountedRoomPages = 0;
+
+/**
+ * Forgets the room when the page goes away (browser back, a link home), so no other page acts on
+ * a room the player is no longer looking at. Deferred a tick so React's StrictMode remount of the
+ * same page does not drop it.
+ */
+function useForgetRoomOnUnmount(): void {
+  useEffect(() => {
+    mountedRoomPages += 1;
+    return () => {
+      mountedRoomPages -= 1;
+      setTimeout(() => {
+        if (mountedRoomPages === 0) useStore.getState().clearRoom();
+      }, 0);
+    };
+  }, []);
+}
+
 export function Room() {
   const params = useParams();
   const code = normalizeCode(params.code ?? '');
   const navigate = useNavigate();
   const room = useStore((state) => state.room);
   const roomNotFound = useStore((state) => state.roomNotFound);
+  const joinError = useStore((state) => state.joinError);
   const status = useStore((state) => state.status);
   const hadRoom = useRef(false);
+  /** hand number the Leave confirmation was asked for */
+  const [confirmLeaveFor, setConfirmLeaveFor] = useState<number | null>(null);
+
+  useForgetRoomOnUnmount();
 
   useEffect(() => {
     ensureConnected();
-    useStore.getState().resetRoomNotFound();
+    useStore.getState().beginJoin(code);
     client.joinRoom(code);
     return () => {
       client.joinRoom(null);
@@ -41,11 +66,25 @@ export function Room() {
   }, [room, code, navigate]);
 
   const leave = () => {
+    setConfirmLeaveFor(null);
     hadRoom.current = false;
     send({ type: 'leave_room' });
     client.joinRoom(null);
     useStore.getState().clearRoom();
     navigate('/');
+  };
+
+  // Leaving mid-hand hands the seat to a bot for good, so ask first.
+  const leaveCostsSeat = room?.status === 'playing' && room.you.seat !== null;
+  const requestLeave = () => {
+    if (room && leaveCostsSeat) setConfirmLeaveFor(room.handNumber);
+    else leave();
+  };
+
+  const retry = () => {
+    useStore.getState().dismissError();
+    useStore.getState().beginJoin(code);
+    client.joinRoom(code);
   };
 
   if (roomNotFound) {
@@ -61,6 +100,26 @@ export function Room() {
   }
 
   if (!room || room.code !== code) {
+    if (joinError) {
+      return (
+        <main className="page centered">
+          <StatusBanner status={status} />
+          <h1 className="home-title">{strings.appName}</h1>
+          <p>{fmt(strings.joinFailed, { code })}</p>
+          <p role="alert" className="join-error">
+            {joinError.message || strings.errorTitle}
+          </p>
+          <div className="button-row button-row-center">
+            <button type="button" className="button button-primary" onClick={retry}>
+              {strings.retry}
+            </button>
+            <Link to="/" className="button">
+              {strings.backHome}
+            </Link>
+          </div>
+        </main>
+      );
+    }
     return (
       <main className="page centered">
         <StatusBanner status={status} />
@@ -78,13 +137,21 @@ export function Room() {
 
   return (
     <div className="room">
-      <TopBar code={room.code} onLeave={leave} />
+      <TopBar code={room.code} onLeave={requestLeave} />
       <StatusBanner status={status} />
       <main className={playing ? 'room-main room-playing' : 'room-main page'}>
         {playing && room.hand ? <Table room={room} hand={room.hand} /> : <Lobby room={room} />}
       </main>
       <ChatPanel room={room} />
       <Toast />
+      {leaveCostsSeat && confirmLeaveFor === room.handNumber && (
+        <ConfirmDialog
+          message={strings.leaveConfirm}
+          confirmLabel={strings.leave}
+          onCancel={() => setConfirmLeaveFor(null)}
+          onConfirm={leave}
+        />
+      )}
     </div>
   );
 }

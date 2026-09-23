@@ -8,6 +8,8 @@
  * - RoomView.acting: the seats the current deadline applies to. In the doubling round this tells
  *   everyone who is still deciding without revealing anyone's choice.
  * - RoomView.redealt: true on the first snapshot after everyone passed and the cards were redealt.
+ * - RoomView.resultSeats: who each seat's share of lastResult was charged to (whoever was seated
+ *   when the hand was dealt). Seats may have changed hands since, so SeatView cannot say.
  */
 import { z } from 'zod';
 import type { HandAction, HandResult, HandView, RuleSettings } from '@landlord/engine';
@@ -92,8 +94,19 @@ export interface SeatView {
   /** running score in this room */
   score: number;
   cardCount: number;
-  /** true when this seat won the last hand (for display) */
+  /** true when whoever sits here now won the last hand in this seat (for display) */
   ready: boolean;
+}
+
+/** Who a seat's share of `lastResult` belongs to: whoever sat there when the hand was dealt. */
+export interface ResultSeatView {
+  seat: number;
+  /** the player's id, or the bot's id for a bot */
+  playerId: string;
+  name: string;
+  isBot: boolean;
+  /** their running score in this room now */
+  score: number;
 }
 
 export interface SpectatorView {
@@ -133,6 +146,8 @@ export interface RoomView {
   acting?: number[];
   /** true on snapshots of a hand that was just redealt because everyone passed */
   redealt?: boolean;
+  /** who each seat's share of `lastResult` was charged to, by seat; empty when there is none */
+  resultSeats?: ResultSeatView[];
   /** last 50 chat entries */
   chat: ChatEntry[];
 }

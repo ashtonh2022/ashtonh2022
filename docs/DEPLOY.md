@@ -24,10 +24,11 @@ PORT=8080 pnpm start
 
 ## Environment variables
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PORT` | `8080` | HTTP and WebSocket port |
-| `HOST` | `0.0.0.0` | Bind address |
-| `ROOM_TTL_MINUTES` | `120` | Empty rooms are deleted after this long |
+| Variable           | Default   | Meaning                                                                                                                                                                       |
+| ------------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`             | `8080`    | HTTP and WebSocket port                                                                                                                                                       |
+| `HOST`             | `0.0.0.0` | Bind address                                                                                                                                                                  |
+| `ROOM_TTL_MINUTES` | `120`     | Empty rooms are deleted after this long                                                                                                                                       |
+| `MAX_ROOMS`        | `500`     | Most rooms held at once. When full, a new room replaces the one nobody has been connected to for longest; creating one is refused only while every room has someone connected |
 
 The client connects to `ws(s)://<same host>/ws`, so no client configuration is needed. Put the server behind HTTPS (Fly, Railway and Render do this for you) and the WebSocket automatically uses `wss://`.

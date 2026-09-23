@@ -1,6 +1,7 @@
 import type { RoomView } from '@landlord/protocol';
 
 import type { SoundName } from '../audio';
+import { isRedeal } from './redeal';
 
 /**
  * Sounds to play when `next` replaces `prev` in the store. The client never diffs events to stay
@@ -16,7 +17,8 @@ export function soundsForSnapshot(prev: RoomView | null, next: RoomView): SoundN
   const newDeal =
     !before ||
     before.handNumber !== hand.handNumber ||
-    (before.phase !== 'bidding' && hand.phase === 'bidding');
+    (before.phase !== 'bidding' && hand.phase === 'bidding') ||
+    isRedeal(prev, next);
   if (newDeal) sounds.push('deal');
 
   if (before && before.landlord === null && hand.landlord !== null) sounds.push('landlord');

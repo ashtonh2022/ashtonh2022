@@ -1,10 +1,15 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { connect as netConnect } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 
 import { hint, type HandAction } from '@landlord/engine';
 import type { ClientMessage, RoomView, ServerMessage } from '@landlord/protocol';
 
-import { silentLogger } from './log';
+import { silentLogger, type Logger } from './log';
 import { startServer, type RunningServer } from './server';
 
 /** A real WebSocket client that can play a hand by itself from the snapshots it receives. */
@@ -216,5 +221,113 @@ describe('server (real sockets)', () => {
     await client.waitFor(() => client.errors.length === 2);
     client.send({ type: 'ping' });
     await client.waitFor(() => client.messages.some((m) => m.type === 'pong'));
+  });
+});
+
+/** Sends raw bytes to the server and resolves with everything it answers before closing. */
+function rawRequest(port: number, text: string, timeoutMs = 3000): Promise<string> {
+  return new Promise((resolve) => {
+    let data = '';
+    const socket = netConnect(port, '127.0.0.1', () => socket.write(text));
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => {
+      data += chunk;
+    });
+    socket.on('error', () => undefined);
+    socket.on('close', () => resolve(data));
+    socket.setTimeout(timeoutMs, () => {
+      socket.destroy();
+      resolve(`${data}<timeout>`);
+    });
+  });
+}
+
+/** A logger that remembers error-level lines. */
+function recordingLogger(): Logger & { errors: string[] } {
+  const errors: string[] = [];
+  return {
+    errors,
+    info: () => undefined,
+    warn: () => undefined,
+    error: (message) => {
+      errors.push(message);
+    },
+  };
+}
+
+describe('server hardening (real sockets)', () => {
+  let server: RunningServer;
+  let webDist: string;
+  const log = recordingLogger();
+
+  beforeAll(async () => {
+    webDist = mkdtempSync(join(tmpdir(), 'landlord-web-'));
+    mkdirSync(join(webDist, 'assets'));
+    mkdirSync(join(webDist, 'audio'));
+    writeFileSync(join(webDist, 'index.html'), '<!doctype html><title>x</title>');
+    writeFileSync(join(webDist, 'assets', 'index-abc123.js'), 'console.log(1)');
+    writeFileSync(join(webDist, 'audio', 'bomb.wav'), 'RIFF');
+    writeFileSync(join(webDist, 'audio', 'bomb.mp3'), 'ID3');
+    writeFileSync(join(webDist, 'audio', 'bomb.ogg'), 'OggS');
+    writeFileSync(join(webDist, 'manifest.webmanifest'), '{}');
+    writeFileSync(join(webDist, 'favicon.ico'), 'ico');
+    writeFileSync(join(webDist, 'logo.svg'), '<svg/>');
+    server = await startServer({ port: 0, host: '127.0.0.1', log, webDist });
+  });
+
+  afterAll(async () => {
+    await server.close();
+    rmSync(webDist, { recursive: true, force: true });
+  });
+
+  const upgradeHeaders =
+    'Host: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n' +
+    'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n';
+
+  it('survives malformed WebSocket upgrade requests (S1)', async () => {
+    for (const target of ['//[', 'http://[/ws', 'http://a:99999/ws']) {
+      const answer = await rawRequest(server.port, `GET ${target} HTTP/1.1\r\n${upgradeHeaders}`);
+      expect(answer).toMatch(/^HTTP\/1\.1 400 /);
+      const health = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+      expect(health.status).toBe(200);
+    }
+    // A well-formed upgrade still works afterwards.
+    const ok = await rawRequest(server.port, `GET /ws HTTP/1.1\r\n${upgradeHeaders}`, 300);
+    expect(ok).toMatch(/^HTTP\/1\.1 101 /);
+  });
+
+  it('answers malformed request targets with 400 and no error log (S10)', async () => {
+    const percent = await fetch(`http://127.0.0.1:${server.port}/%`);
+    expect(percent.status).toBe(400);
+    const partial = await fetch(`http://127.0.0.1:${server.port}/%E0%A4%A`);
+    expect(partial.status).toBe(400);
+    const raw = await rawRequest(
+      server.port,
+      'GET //[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+    );
+    expect(raw).toMatch(/^HTTP\/1\.1 400 /);
+    const index = await fetch(`http://127.0.0.1:${server.port}/`);
+    expect(index.status).toBe(200);
+    expect(log.errors).toEqual([]);
+  });
+
+  it('caches only hashed /assets forever and serves audio and manifest types (S11)', async () => {
+    const head = async (path: string): Promise<[string | null, string | null]> => {
+      const response = await fetch(`http://127.0.0.1:${server.port}${path}`, { method: 'HEAD' });
+      expect(response.status).toBe(200);
+      return [response.headers.get('content-type'), response.headers.get('cache-control')];
+    };
+    expect(await head('/assets/index-abc123.js')).toEqual([
+      'text/javascript; charset=utf-8',
+      'public, max-age=31536000, immutable',
+    ]);
+    expect(await head('/audio/bomb.wav')).toEqual(['audio/wav', 'no-cache']);
+    expect(await head('/audio/bomb.mp3')).toEqual(['audio/mpeg', 'no-cache']);
+    expect(await head('/audio/bomb.ogg')).toEqual(['audio/ogg', 'no-cache']);
+    expect(await head('/manifest.webmanifest')).toEqual(['application/manifest+json', 'no-cache']);
+    expect(await head('/favicon.ico')).toEqual(['image/x-icon', 'no-cache']);
+    expect(await head('/logo.svg')).toEqual(['image/svg+xml', 'no-cache']);
+    expect(await head('/index.html')).toEqual(['text/html; charset=utf-8', 'no-cache']);
+    expect(await head('/room/ABCDEF')).toEqual(['text/html; charset=utf-8', 'no-cache']);
   });
 });

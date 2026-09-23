@@ -1,17 +1,26 @@
 import { PROTOCOL_VERSION, type ClientMessage } from '@landlord/protocol';
 
 import { secureRandom, systemClock, type Clock, type RandomSource } from './clock';
-import { Connection, type ConnectionHandler, type Transport } from './connection';
+import { Connection, HELLO_LIMIT, type ConnectionHandler, type Transport } from './connection';
 import { consoleLogger, type Logger } from './log';
 import { cleanName, PlayerRegistry, type Player } from './players';
 import type { Room, RoomResult } from './room';
 import { DEFAULT_ROOM_TTL_MS, RoomManager } from './rooms';
+
+/** Rooms the server holds at most unless configured otherwise (env MAX_ROOMS). */
+export const DEFAULT_MAX_ROOMS = 500;
+export const SERVER_FULL_MESSAGE = 'The server is full right now. Try again later.';
 
 export interface HubOptions {
   clock?: Clock;
   random?: RandomSource;
   log?: Logger;
   roomTtlMs?: number;
+  /**
+   * Most rooms held at once. When full, create_room closes the room nobody has been connected to
+   * for longest; it is refused (rate_limited) only while every room has somebody connected.
+   */
+  maxRooms?: number;
 }
 
 /**
@@ -27,20 +36,22 @@ export class Hub implements ConnectionHandler {
   readonly rooms: RoomManager;
   private readonly connections = new Set<Connection>();
   private readonly roomTtlMs: number;
+  private readonly maxRooms: number;
 
   constructor(options: HubOptions = {}) {
     this.clock = options.clock ?? systemClock;
     this.random = options.random ?? secureRandom;
     this.log = options.log ?? consoleLogger;
     this.roomTtlMs = options.roomTtlMs ?? DEFAULT_ROOM_TTL_MS;
-    this.players = new PlayerRegistry({ random: this.random, now: () => this.clock.now() });
+    this.maxRooms = options.maxRooms ?? DEFAULT_MAX_ROOMS;
+    this.players = new PlayerRegistry({ random: this.random });
     this.rooms = new RoomManager({
       clock: this.clock,
       random: this.random,
       players: this.players,
       log: this.log,
       ttlMs: this.roomTtlMs,
-      onSweep: (now) => this.players.sweep(now, this.roomTtlMs),
+      onSweep: () => this.players.sweep(),
     });
   }
 
@@ -97,6 +108,21 @@ export class Hub implements ConnectionHandler {
         return;
       }
       case 'create_room': {
+        // Both checks come before anything changes, so a refusal costs the player nothing. A full
+        // server makes space by closing a room nobody is connected to: rooms left behind by
+        // throwaway connections must not lock everyone else out until they expire.
+        if (!this.rooms.hasSpace(this.maxRooms)) {
+          connection.error('rate_limited', SERVER_FULL_MESSAGE);
+          return;
+        }
+        if (!connection.allowRoomCreation()) {
+          connection.error(
+            'rate_limited',
+            'You are creating rooms too quickly. Try again in a minute.',
+          );
+          return;
+        }
+        this.rooms.makeSpace(this.maxRooms);
         const current = this.roomOf(player);
         if (current !== undefined) this.leaveRoom(player, current);
         this.rooms.create(player, message.rules).broadcast();
@@ -109,7 +135,15 @@ export class Hub implements ConnectionHandler {
           return;
         }
         const current = this.roomOf(player);
-        if (current !== undefined && current !== room) this.leaveRoom(player, current);
+        if (current !== room) {
+          // Check the target first: a full room must not cost the player their current one.
+          const refused = room.canJoin(player);
+          if (refused !== null) {
+            this.reply(connection, refused);
+            return;
+          }
+          if (current !== undefined) this.leaveRoom(player, current);
+        }
         this.reply(connection, room.join(player));
         return;
       }
@@ -181,6 +215,12 @@ export class Hub implements ConnectionHandler {
   // -------------------------------------------------------------------------
 
   private hello(connection: Connection, message: Extract<ClientMessage, { type: 'hello' }>): void {
+    connection.helloCount += 1;
+    if (connection.helloCount > HELLO_LIMIT) {
+      connection.error('bad_message', 'too many hello messages on one connection');
+      connection.terminate(1008, 'too many hello messages');
+      return;
+    }
     if (message.protocol !== PROTOCOL_VERSION) {
       connection.error(
         'bad_message',
@@ -193,7 +233,6 @@ export class Hub implements ConnectionHandler {
     const player = this.players.identify(message.playerId, message.token, message.name);
     connection.player = player;
     player.connections.add(connection);
-    player.lastSeen = this.clock.now();
     connection.send({
       type: 'welcome',
       playerId: player.id,
@@ -210,12 +249,13 @@ export class Hub implements ConnectionHandler {
     if (player === null) return;
     connection.player = null;
     player.connections.delete(connection);
-    player.lastSeen = this.clock.now();
     const room = this.roomOf(player);
     if (room !== undefined) {
       room.onConnectionChange(player);
       this.deleteIfAbandoned(room);
     }
+    // Nobody needs a player with no connection and no room; their token brings them back.
+    this.players.release(player);
   }
 
   private roomOf(player: Player): Room | undefined {
@@ -235,7 +275,7 @@ export class Hub implements ConnectionHandler {
 
   /** A room with no humans left in it (seated or watching) has nobody to come back to it. */
   private deleteIfAbandoned(room: Room): void {
-    if (!room.isDestroyed && room.humanCount() === 0) this.rooms.delete(room.code);
+    this.rooms.deleteIfAbandoned(room);
   }
 
   private reply(connection: Connection, result: RoomResult): void {

@@ -26,6 +26,11 @@ export const MESSAGE_LIMIT = 30;
 export const MESSAGE_WINDOW_MS = 5_000;
 /** Frames larger than this are rejected without being decoded (the protocol caps text at 8 KiB). */
 export const MAX_FRAME_BYTES = 16 * 1024;
+/** `hello` messages allowed on one connection; the next one closes it. */
+export const HELLO_LIMIT = 3;
+/** Rooms one connection may create in a sliding window. */
+export const CREATE_ROOM_LIMIT = 3;
+export const CREATE_ROOM_WINDOW_MS = 60_000;
 
 let nextConnectionId = 1;
 
@@ -37,7 +42,10 @@ let nextConnectionId = 1;
 export class Connection {
   readonly id = nextConnectionId++;
   player: Player | null = null;
+  /** `hello` messages received so far. */
+  helloCount = 0;
   private readonly recent: number[] = [];
+  private readonly roomsCreated: number[] = [];
   private limitNotified = false;
   private closed = false;
 
@@ -113,6 +121,16 @@ export class Connection {
     } catch (err) {
       this.log.error(`connection ${this.id}: close handler failed`, err);
     }
+  }
+
+  /** Records a create_room when this connection is still under its limit; false otherwise. */
+  allowRoomCreation(): boolean {
+    const cutoff = this.clock.now() - CREATE_ROOM_WINDOW_MS;
+    const times = this.roomsCreated;
+    while (times.length > 0 && (times[0] as number) <= cutoff) times.shift();
+    if (times.length >= CREATE_ROOM_LIMIT) return false;
+    times.push(this.clock.now());
+    return true;
   }
 
   private allow(): boolean {

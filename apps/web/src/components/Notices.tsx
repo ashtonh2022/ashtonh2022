@@ -16,16 +16,25 @@ export function StatusBanner({ status }: { status: ConnectionStatus }) {
   );
 }
 
-/** The last server error, auto-hidden after four seconds. */
+/**
+ * The last server error, hidden four seconds after it arrived. An older error (one that arrived
+ * while no toast was on screen) is never shown.
+ */
 export function Toast() {
   const error = useStore((state) => state.lastError);
   const dismiss = useStore((state) => state.dismissError);
+  const expired = error !== null && Date.now() - error.at >= TOAST_MS;
   useEffect(() => {
     if (!error) return;
-    const timer = setTimeout(dismiss, TOAST_MS);
+    const left = TOAST_MS - (Date.now() - error.at);
+    if (left <= 0) {
+      dismiss();
+      return;
+    }
+    const timer = setTimeout(dismiss, left);
     return () => clearTimeout(timer);
   }, [error, dismiss]);
-  if (!error) return null;
+  if (!error || expired) return null;
   return (
     <div className="toast" role="alert">
       <span className="toast-text">{error.message || strings.errorTitle}</span>

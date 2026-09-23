@@ -22,11 +22,11 @@ export function Home() {
   const navigate = useNavigate();
   const name = useStore((state) => state.name);
   const setName = useStore((state) => state.setName);
-  const room = useStore((state) => state.room);
   const status = useStore((state) => state.status);
+  const creating = useStore((state) => state.creating !== null);
+  const createdRoom = useStore((state) => state.createdRoom);
   const [rules, setRules] = useState(defaultRules);
   const [code, setCode] = useState('');
-  const [creating, setCreating] = useState(false);
   const nameTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -34,16 +34,20 @@ export function Home() {
     if (!useStore.getState().name && client.identity.name) setName(client.identity.name);
   }, [setName]);
 
+  // A click is only good for this visit to the page.
+  useEffect(() => () => useStore.getState().endCreate(), []);
+
+  // Go to the room this click created (the store tells it apart from a returning player's old
+  // room, see beginCreate).
   useEffect(() => {
-    if (creating && room) {
-      setCreating(false);
-      navigate(`/room/${room.code}`);
-    }
-  }, [creating, room, navigate]);
+    if (createdRoom === null) return;
+    useStore.getState().endCreate();
+    navigate(`/room/${createdRoom}`);
+  }, [createdRoom, navigate]);
 
   useEffect(() => {
     if (!creating) return;
-    const timer = setTimeout(() => setCreating(false), CREATE_TIMEOUT_MS);
+    const timer = setTimeout(() => useStore.getState().endCreate(), CREATE_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [creating]);
 
@@ -64,7 +68,9 @@ export function Home() {
 
   const createRoom = () => {
     flushName();
-    setCreating(true);
+    useStore.getState().beginCreate();
+    // The pong marks where the server's answers to this click begin.
+    send({ type: 'ping' });
     send({ type: 'create_room', rules });
   };
 

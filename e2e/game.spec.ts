@@ -63,6 +63,7 @@ test('a 3-player room with bots plays a full hand', async ({ page }) => {
   }
 
   await expect(result).toBeVisible({ timeout: 30_000 });
-  await expect(result.getByText(/wins/)).toBeVisible();
+  // "The Landlord wins" or "The Peasants win", whichever side went out first
+  await expect(result.getByText(/^The (Landlord wins|Peasants win)/)).toBeVisible();
   await expect(page.getByText(/Final stake/)).toBeVisible();
 });

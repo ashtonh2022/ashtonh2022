@@ -193,4 +193,4 @@ Empty seats can be filled with bots from the lobby, so you can play with fewer t
 
 ## Rooms
 
-Create a room from the home screen, choose the player count and options, and share the room link. Friends who open the link join the lobby. When every seat is filled (by people or bots) the host starts the hand. Extra people who join a full room watch as spectators and can take a seat when one opens up. Players keep the same seat and the running score for as long as the room lasts.
+Create a room from the home screen, choose the player count and options, and share the room link. Friends who open the link join the lobby. When every seat is filled (by people or bots) the host starts the hand. Extra people who join a full room watch as spectators and can take a seat when one opens up. Your running score belongs to you, not your seat: it follows you if you change seats, and it is kept if you leave and come back while the room lasts. The result of a hand counts for whoever was seated when it was dealt, even if they leave before it ends and a bot finishes it for them.

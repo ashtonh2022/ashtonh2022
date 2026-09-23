@@ -11,7 +11,8 @@ interface TimerRingProps {
 
 /** A countdown ring around the remaining seconds. */
 export function TimerRing({ deadline, turnSeconds, now, size = 36 }: TimerRingProps) {
-  const left = secondsLeft(deadline, now);
+  // `now` can be a tick (up to 250 ms) older than the deadline: never show "31" for a 30 s turn.
+  const left = Math.min(turnSeconds, secondsLeft(deadline, now));
   const total = Math.max(1, turnSeconds * 1000);
   const fraction = Math.max(0, Math.min(1, (deadline - now) / total));
   const radius = (size - 4) / 2;
