@@ -151,6 +151,20 @@ describe('server (real sockets)', () => {
     return client;
   }
 
+  it('shows on /ip the address it counts you as, ignoring X-Forwarded-For with no trusted proxy', async () => {
+    const response = await fetch(`http://127.0.0.1:${server.port}/ip`, {
+      headers: { 'x-forwarded-for': '198.51.100.9' },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(await response.json()).toEqual({
+      ip: '127.0.0.1',
+      limitKey: '127.0.0.1',
+      trustProxy: 0,
+      hops: ['198.51.100.9', '127.0.0.1'],
+    });
+  });
+
   it('answers /healthz and rejects other upgrade paths', async () => {
     const response = await fetch(`http://127.0.0.1:${server.port}/healthz`);
     expect(response.status).toBe(200);
@@ -380,6 +394,18 @@ describe('per-IP limits (real sockets)', () => {
   afterAll(async () => {
     await Promise.all([...sockets.map(closeSocket), ...clients.map((client) => client.close())]);
     await server.close();
+  });
+
+  it('shows on /ip the hop the trusted proxy vouches for, not what the client wrote', async () => {
+    const response = await fetch(`http://127.0.0.1:${server.port}/ip`, {
+      headers: { 'x-forwarded-for': '198.51.100.9, 203.0.113.7' },
+    });
+    expect(await response.json()).toEqual({
+      ip: '203.0.113.7',
+      limitKey: '203.0.113.7',
+      trustProxy: 1,
+      hops: ['198.51.100.9', '203.0.113.7', '127.0.0.1'],
+    });
   });
 
   it('refuses the 21st WebSocket from one IP with 429 and frees a slot when one closes', async () => {

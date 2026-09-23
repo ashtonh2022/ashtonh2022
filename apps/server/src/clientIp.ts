@@ -52,7 +52,8 @@ export function parseIp(raw: string): string | null {
 }
 
 /** The request's hops, oldest first: X-Forwarded-For entries, then the socket's address. */
-function hops(
+/** Every hop the request came through: the X-Forwarded-For entries, then the socket's address. */
+export function forwardedHops(
   forwardedFor: string | string[] | undefined,
   remoteAddress: string | undefined,
 ): string[] {
@@ -78,7 +79,7 @@ export function clientIp(
   trustProxy: number,
 ): string | null {
   const trusted = Number.isFinite(trustProxy) ? Math.max(0, Math.floor(trustProxy)) : 0;
-  const list = trusted === 0 ? [remoteAddress ?? ''] : hops(forwardedFor, remoteAddress);
+  const list = trusted === 0 ? [remoteAddress ?? ''] : forwardedHops(forwardedFor, remoteAddress);
   for (let index = Math.max(0, list.length - 1 - trusted); index < list.length; index++) {
     const ip = parseIp(list[index] as string);
     if (ip !== null) return ip;

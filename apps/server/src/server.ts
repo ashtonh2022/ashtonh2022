@@ -4,7 +4,7 @@ import type { Duplex } from 'node:stream';
 
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { clientIpKey, DEFAULT_TRUST_PROXY } from './clientIp';
+import { clientIp, clientIpKey, DEFAULT_TRUST_PROXY, forwardedHops } from './clientIp';
 import { DEFAULT_MAX_ROOM_CREATES_PER_IP, Hub } from './hub';
 import { consoleLogger, type Logger } from './log';
 import { DEFAULT_ROOM_TTL_MS } from './rooms';
@@ -111,6 +111,25 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
       if (pathname === '/healthz') {
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (pathname === '/ip') {
+        // Lets an operator check TRUST_PROXY after deploying: `ip` must be their own address.
+        const forwardedFor = req.headers['x-forwarded-for'];
+        const remoteAddress = req.socket.remoteAddress;
+        const ip = clientIp(forwardedFor, remoteAddress, trustProxy);
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        });
+        res.end(
+          JSON.stringify({
+            ip,
+            limitKey: clientIpKey(forwardedFor, remoteAddress, trustProxy),
+            trustProxy,
+            hops: forwardedHops(forwardedFor, remoteAddress),
+          }),
+        );
         return;
       }
       serveStatic(req, res).catch((err: unknown) => {

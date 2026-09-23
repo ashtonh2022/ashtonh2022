@@ -10,6 +10,8 @@ A web version of Dou Dizhu ("Fight the Landlord") for English speakers. Create a
 
 Rules: [docs/RULES.md](docs/RULES.md). Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Deploying: [docs/DEPLOY.md](docs/DEPLOY.md).
 
+**Play online:** the game is one Docker service. The fastest way to get a public link is Render's free tier, which takes about five minutes and is described step by step in [docs/DEPLOY.md](docs/DEPLOY.md#quickest-render-free-tier).
+
 ## Quick start
 
 Requires Node 22 and pnpm 10 (`corepack enable` gives you pnpm).
