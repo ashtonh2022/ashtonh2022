@@ -39,8 +39,12 @@ class TestClient {
     });
   }
 
-  static async connect(port: number, name: string): Promise<TestClient> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  static async connect(
+    port: number,
+    name: string,
+    headers: Record<string, string> = {},
+  ): Promise<TestClient> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers });
     await new Promise<void>((resolve, reject) => {
       ws.once('open', () => resolve());
       ws.once('error', reject);
@@ -329,5 +333,120 @@ describe('server hardening (real sockets)', () => {
     expect(await head('/logo.svg')).toEqual(['image/svg+xml', 'no-cache']);
     expect(await head('/index.html')).toEqual(['text/html; charset=utf-8', 'no-cache']);
     expect(await head('/room/ABCDEF')).toEqual(['text/html; charset=utf-8', 'no-cache']);
+  });
+});
+
+/** Opens a raw WebSocket from `ip` (sent as X-Forwarded-For); resolves with it or the HTTP status. */
+function openFrom(port: number, ip: string): Promise<WebSocket | number> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { 'X-Forwarded-For': ip } });
+    ws.once('open', () => resolve(ws));
+    ws.once('unexpected-response', (req, res) => {
+      resolve(res.statusCode ?? 0);
+      req.destroy();
+    });
+    ws.once('error', reject);
+  });
+}
+
+function closeSocket(ws: WebSocket): Promise<void> {
+  return new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve();
+      return;
+    }
+    ws.once('close', () => resolve());
+    ws.close();
+  });
+}
+
+describe('per-IP limits (real sockets)', () => {
+  let server: RunningServer;
+  const sockets: WebSocket[] = [];
+  const clients: TestClient[] = [];
+
+  beforeAll(async () => {
+    // One trusted proxy: the last X-Forwarded-For entry is the client, so tests can be many IPs.
+    server = await startServer({
+      port: 0,
+      host: '127.0.0.1',
+      log: silentLogger,
+      webDist: '/nonexistent/web/dist',
+      trustProxy: 1,
+      maxRoomCreatesPerIp: 2,
+    });
+  });
+
+  afterAll(async () => {
+    await Promise.all([...sockets.map(closeSocket), ...clients.map((client) => client.close())]);
+    await server.close();
+  });
+
+  it('refuses the 21st WebSocket from one IP with 429 and frees a slot when one closes', async () => {
+    const a = '203.0.113.10';
+    for (let i = 0; i < 20; i++) {
+      const ws = await openFrom(server.port, a);
+      expect(ws).toBeInstanceOf(WebSocket);
+      sockets.push(ws as WebSocket);
+    }
+    expect(await openFrom(server.port, a)).toBe(429);
+    // What the client wrote before the proxy's entry does not make it someone else.
+    expect(await openFrom(server.port, `198.51.100.99, ${a}`)).toBe(429);
+    // Another IP is not affected.
+    const b = await openFrom(server.port, '203.0.113.11');
+    expect(b).toBeInstanceOf(WebSocket);
+    sockets.push(b as WebSocket);
+
+    await closeSocket(sockets.shift() as WebSocket);
+    let again: WebSocket | number = 429;
+    for (let attempt = 0; attempt < 50 && again === 429; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 20));
+      again = await openFrom(server.port, a);
+    }
+    expect(again).toBeInstanceOf(WebSocket);
+    sockets.push(again as WebSocket);
+    expect(await openFrom(server.port, a)).toBe(429);
+  });
+
+  it('frees the slot of an upgrade whose handshake fails', async () => {
+    const ip = '203.0.113.12';
+    const badUpgrade =
+      `GET /ws HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: ${ip}\r\n` +
+      'Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n';
+    for (let i = 0; i < 25; i++) {
+      expect(await rawRequest(server.port, badUpgrade)).toMatch(/^HTTP\/1\.1 400 /);
+    }
+    const ws = await openFrom(server.port, ip);
+    expect(ws).toBeInstanceOf(WebSocket);
+    sockets.push(ws as WebSocket);
+  });
+
+  it('limits create_room per IP across connections (maxRoomCreatesPerIp)', async () => {
+    const ip = { 'X-Forwarded-For': '203.0.113.20' };
+    const [first, second, third] = await Promise.all([
+      TestClient.connect(server.port, 'One', ip),
+      TestClient.connect(server.port, 'Two', ip),
+      TestClient.connect(server.port, 'Three', ip),
+    ]);
+    const elsewhere = await TestClient.connect(server.port, 'Four', {
+      'X-Forwarded-For': '203.0.113.21',
+    });
+    clients.push(first as TestClient, second as TestClient, third as TestClient, elsewhere);
+    for (const client of [first, second] as TestClient[]) {
+      client.send({ type: 'create_room', rules: {} });
+      await client.waitFor(() => client.room !== null);
+    }
+    const late = third as TestClient;
+    late.send({ type: 'create_room', rules: {} });
+    await late.waitFor(() => late.errors.length > 0);
+    expect(late.errors[0]).toEqual({
+      type: 'error',
+      code: 'rate_limited',
+      message: 'You are creating rooms too quickly. Try again in a few minutes.',
+    });
+    expect(late.room).toBeNull();
+    elsewhere.send({ type: 'create_room', rules: {} });
+    await elsewhere.waitFor(() => elsewhere.room !== null);
+    expect(elsewhere.errors).toEqual([]);
   });
 });

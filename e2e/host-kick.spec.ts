@@ -49,9 +49,21 @@ test('the host kicks a player during play and a bot takes their seat', async ({ 
   await expect(host.page.getByTestId('centre').locator('.trick')).toBeVisible();
   await expect(host.page.getByText(guest.name, { exact: true })).toHaveCount(0);
 
-  // The kicked player is sent home and is no longer seated anywhere in the room.
+  // The kicked player is sent home, told why, and is no longer seated anywhere in the room.
   await expect(guest.page).toHaveURL(/\/$/, { timeout: 10_000 });
   await expect(guest.page.getByRole('button', { name: 'Create room' })).toBeVisible();
+  const code = new URL(url).pathname.split('/').pop();
+  const why = guest.page.getByText(`The host removed you from room ${code}.`, { exact: true });
+  await expect(why).toBeVisible();
+  // It stays until dismissed.
+  await guest.page.waitForTimeout(1_000);
+  await expect(why).toBeVisible();
+  await guest.page
+    .getByRole('alert')
+    .filter({ has: why })
+    .getByRole('button', { name: 'Dismiss' })
+    .click();
+  await expect(why).toHaveCount(0);
 
   await closeAll(players);
 });

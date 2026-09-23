@@ -22,6 +22,12 @@ export const strings = {
   errorTitle: 'Something went wrong',
   dismiss: 'Dismiss',
 
+  // Notices from the host
+  kickedFromRoom: 'The host removed you from room {code}.',
+  kickedFromUnknownRoom: 'The host removed you from the room.',
+  movedToSpectators:
+    'The host moved you to the spectators. You can take a seat again when one is free.',
+
   // Home
   yourName: 'Your name',
   namePlaceholder: 'Enter your name',

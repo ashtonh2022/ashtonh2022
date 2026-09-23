@@ -3,13 +3,21 @@ import { PROTOCOL_VERSION, type ClientMessage } from '@landlord/protocol';
 import { secureRandom, systemClock, type Clock, type RandomSource } from './clock';
 import { Connection, HELLO_LIMIT, type ConnectionHandler, type Transport } from './connection';
 import { consoleLogger, type Logger } from './log';
-import { cleanName, PlayerRegistry, type Player } from './players';
+import { cleanName, PlayerRegistry, type PendingKick, type Player } from './players';
 import type { Room, RoomResult } from './room';
 import { DEFAULT_ROOM_TTL_MS, RoomManager } from './rooms';
 
 /** Rooms the server holds at most unless configured otherwise (env MAX_ROOMS). */
 export const DEFAULT_MAX_ROOMS = 500;
 export const SERVER_FULL_MESSAGE = 'The server is full right now. Try again later.';
+/**
+ * Rooms all connections from one IP (see clientIp.ts) may create together per window, unless
+ * configured otherwise (env MAX_ROOM_CREATES_PER_IP).
+ */
+export const DEFAULT_MAX_ROOM_CREATES_PER_IP = 10;
+export const IP_CREATE_WINDOW_MS = 10 * 60 * 1000;
+export const IP_CREATE_LIMIT_MESSAGE =
+  'You are creating rooms too quickly. Try again in a few minutes.';
 
 export interface HubOptions {
   clock?: Clock;
@@ -21,6 +29,11 @@ export interface HubOptions {
    * for longest; it is refused (rate_limited) only while every room has somebody connected.
    */
   maxRooms?: number;
+  /**
+   * create_room allowed per IP per IP_CREATE_WINDOW_MS, across all its connections. Connections
+   * without an IP (in-process transports) are not limited this way. Default 10.
+   */
+  maxRoomCreatesPerIp?: number;
 }
 
 /**
@@ -37,6 +50,9 @@ export class Hub implements ConnectionHandler {
   private readonly connections = new Set<Connection>();
   private readonly roomTtlMs: number;
   private readonly maxRooms: number;
+  private readonly maxRoomCreatesPerIp: number;
+  /** Epoch ms of recent create_room by IP key, oldest first. */
+  private readonly roomCreatesByIp = new Map<string, number[]>();
 
   constructor(options: HubOptions = {}) {
     this.clock = options.clock ?? systemClock;
@@ -44,6 +60,7 @@ export class Hub implements ConnectionHandler {
     this.log = options.log ?? consoleLogger;
     this.roomTtlMs = options.roomTtlMs ?? DEFAULT_ROOM_TTL_MS;
     this.maxRooms = options.maxRooms ?? DEFAULT_MAX_ROOMS;
+    this.maxRoomCreatesPerIp = options.maxRoomCreatesPerIp ?? DEFAULT_MAX_ROOM_CREATES_PER_IP;
     this.players = new PlayerRegistry({ random: this.random });
     this.rooms = new RoomManager({
       clock: this.clock,
@@ -51,12 +68,20 @@ export class Hub implements ConnectionHandler {
       players: this.players,
       log: this.log,
       ttlMs: this.roomTtlMs,
-      onSweep: () => this.players.sweep(),
+      onSweep: (now) => {
+        this.players.sweep(now);
+        this.pruneRoomCreates(now);
+      },
     });
   }
 
   get connectionCount(): number {
     return this.connections.size;
+  }
+
+  /** IPs with a create_room inside the current window (kept for their per-IP limit). */
+  get trackedCreateIps(): number {
+    return this.roomCreatesByIp.size;
   }
 
   /** Starts the periodic room sweep. */
@@ -72,9 +97,13 @@ export class Hub implements ConnectionHandler {
     this.rooms.clear();
   }
 
-  /** Wraps a freshly opened socket. Feed its frames to `connection.receive`. */
-  connect(transport: Transport): Connection {
-    const connection = new Connection(transport, this, this.clock, this.log);
+  /**
+   * Wraps a freshly opened socket. Feed its frames to `connection.receive`. `ip` is the key the
+   * per-IP limits count it under (server.ts works it out from the request, see clientIp.ts); leave
+   * it out for in-process transports.
+   */
+  connect(transport: Transport, ip: string | null = null): Connection {
+    const connection = new Connection(transport, this, this.clock, this.log, ip);
     this.connections.add(connection);
     return connection;
   }
@@ -93,6 +122,7 @@ export class Hub implements ConnectionHandler {
       connection.error('bad_message', 'send hello first');
       return;
     }
+    this.confirmKick(connection, player);
     switch (message.type) {
       case 'ping':
         connection.send({ type: 'pong' });
@@ -108,11 +138,16 @@ export class Hub implements ConnectionHandler {
         return;
       }
       case 'create_room': {
-        // Both checks come before anything changes, so a refusal costs the player nothing. A full
-        // server makes space by closing a room nobody is connected to: rooms left behind by
+        // Every check comes before anything changes, so a refusal costs the player nothing. A
+        // full server makes space by closing a room nobody is connected to: rooms left behind by
         // throwaway connections must not lock everyone else out until they expire.
         if (!this.rooms.hasSpace(this.maxRooms)) {
           connection.error('rate_limited', SERVER_FULL_MESSAGE);
+          return;
+        }
+        // Per IP before per connection: opening more connections must not buy more rooms.
+        if (!this.ipMayCreateRoom(connection.ip)) {
+          connection.error('rate_limited', IP_CREATE_LIMIT_MESSAGE);
           return;
         }
         if (!connection.allowRoomCreation()) {
@@ -122,9 +157,12 @@ export class Hub implements ConnectionHandler {
           );
           return;
         }
+        this.recordRoomCreate(connection.ip);
         this.rooms.makeSpace(this.maxRooms);
         const current = this.roomOf(player);
         if (current !== undefined) this.leaveRoom(player, current);
+        // A room of their own is moving on: any kick is old news.
+        player.pendingKick = null;
         this.rooms.create(player, message.rules).broadcast();
         return;
       }
@@ -150,7 +188,7 @@ export class Hub implements ConnectionHandler {
       case 'leave_room': {
         const room = this.roomOf(player);
         if (room === undefined) {
-          connection.send({ type: 'left_room' });
+          connection.send({ type: 'left_room', reason: 'left' });
           return;
         }
         this.leaveRoom(player, room);
@@ -233,6 +271,13 @@ export class Hub implements ConnectionHandler {
     const player = this.players.identify(message.playerId, message.token, message.name);
     connection.player = player;
     player.connections.add(connection);
+    const kick = this.kickToTell(connection, player);
+    // Before the welcome: the web client rejoins its room as soon as it is welcomed, so it must
+    // already know it was kicked from that room, or it would walk straight back in.
+    if (kick?.outcome === 'removed') {
+      kick.heardOn.add(connection);
+      connection.send({ type: 'left_room', reason: 'kicked', code: kick.code });
+    }
     connection.send({
       type: 'welcome',
       playerId: player.id,
@@ -242,6 +287,67 @@ export class Hub implements ConnectionHandler {
     });
     // A returning player is put straight back into their room.
     this.roomOf(player)?.onConnectionChange(player);
+    // After the snapshot, as when it happens live: the client already shows them watching.
+    if (kick?.outcome === 'spectators') {
+      kick.heardOn.add(connection);
+      connection.send({ type: 'notice', notice: 'moved_to_spectators', code: kick.code });
+    }
+  }
+
+  /**
+   * The kick this connection should be told about on its hello: the player's pending kick, unless
+   * it went out on this connection already. One that is no longer true (they are back in that
+   * room, or seated again) is forgotten instead.
+   */
+  private kickToTell(connection: Connection, player: Player): PendingKick | null {
+    const kick = player.pendingKick;
+    if (kick === null || kick.heardOn.has(connection)) return null;
+    const room = this.rooms.get(kick.code);
+    const stillTrue =
+      kick.outcome === 'removed'
+        ? room?.isMember(player.id) !== true
+        : room !== undefined && !room.isDestroyed && room.seatOf(player.id) === null;
+    if (stillTrue) return kick;
+    player.pendingKick = null;
+    return null;
+  }
+
+  /**
+   * A connection a kick went out on as it happened spoke again, so the link was alive and the
+   * kick arrived there. Once every such connection has, nobody needs telling any more.
+   */
+  private confirmKick(connection: Connection, player: Player): void {
+    const kick = player.pendingKick;
+    if (kick === null || !kick.awaiting.delete(connection)) return;
+    if (kick.awaiting.size === 0 && !kick.lost) player.pendingKick = null;
+  }
+
+  /** Recent create_room times of an IP key, with those older than the window dropped. */
+  private recentRoomCreates(ip: string, now: number): number[] {
+    const times = this.roomCreatesByIp.get(ip) ?? [];
+    const cutoff = now - IP_CREATE_WINDOW_MS;
+    while (times.length > 0 && (times[0] as number) <= cutoff) times.shift();
+    return times;
+  }
+
+  private ipMayCreateRoom(ip: string | null): boolean {
+    if (ip === null) return true;
+    return this.recentRoomCreates(ip, this.clock.now()).length < this.maxRoomCreatesPerIp;
+  }
+
+  private recordRoomCreate(ip: string | null): void {
+    if (ip === null) return;
+    const now = this.clock.now();
+    const times = this.recentRoomCreates(ip, now);
+    times.push(now);
+    this.roomCreatesByIp.set(ip, times);
+  }
+
+  /** Forgets IPs with no create_room left inside the window (runs with the periodic sweep). */
+  private pruneRoomCreates(now: number): void {
+    for (const ip of [...this.roomCreatesByIp.keys()]) {
+      if (this.recentRoomCreates(ip, now).length === 0) this.roomCreatesByIp.delete(ip);
+    }
   }
 
   private detach(connection: Connection): void {
@@ -249,6 +355,9 @@ export class Hub implements ConnectionHandler {
     if (player === null) return;
     connection.player = null;
     player.connections.delete(connection);
+    // Closed without a word since the kick went out: it may never have arrived there.
+    const kick = player.pendingKick;
+    if (kick !== null && kick.awaiting.delete(connection)) kick.lost = true;
     const room = this.roomOf(player);
     if (room !== undefined) {
       room.onConnectionChange(player);

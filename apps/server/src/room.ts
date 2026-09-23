@@ -16,6 +16,7 @@ import {
   CHAT_MAX,
   type ChatEntry,
   type Emote,
+  type LeaveReason,
   type ResultSeatView,
   type RoomStatus,
   type RoomView,
@@ -28,7 +29,7 @@ import {
 import { botDelay, botPlayerId, pickBotName } from './bots';
 import type { Clock, RandomSource, TimerHandle } from './clock';
 import type { Logger } from './log';
-import type { Player, PlayerRegistry } from './players';
+import { forgetKick, recordKick, type Player, type PlayerRegistry } from './players';
 
 /** Chat entries kept (and sent) per room. */
 export const CHAT_LOG_MAX = 50;
@@ -241,17 +242,23 @@ export class Room {
   join(player: Player): RoomResult {
     const refused = this.canJoin(player);
     if (refused !== null) return refused;
-    if (!this.isMember(player.id)) this.spectators.push(player.id);
+    if (!this.isMember(player.id)) {
+      this.spectators.push(player.id);
+      // Joining a room, the one they were kicked from included, is moving on: the kick is old news.
+      player.pendingKick = null;
+    }
     player.roomCode = this.code;
     this.broadcast();
     return null;
   }
 
   /**
-   * A player leaves for good (leave_room, kicked, or joining another room). During a hand their
-   * seat is handed to a bot for the rest of the room's life; otherwise it is simply freed.
+   * A player leaves for good: `left` for leave_room or joining another room, `kicked` when the
+   * host removed them. During a hand their seat is handed to a bot for the rest of the room's
+   * life; otherwise it is simply freed. Their connections get `left_room` with the reason; a kick
+   * is also kept until it surely arrived, for their next `hello` (Player.pendingKick).
    */
-  leave(player: Player): void {
+  leave(player: Player, reason: LeaveReason = 'left'): void {
     const seat = this.seatOf(player.id);
     let handedToBot = false;
     if (seat !== null) {
@@ -264,7 +271,9 @@ export class Room {
     }
     this.spectators = this.spectators.filter((id) => id !== player.id);
     if (player.roomCode === this.code) player.roomCode = null;
-    this.sendTo(player, { type: 'left_room' });
+    if (reason === 'kicked') recordKick(player, this.code, this.deps.clock.now(), 'removed');
+    else forgetKick(player, this.code);
+    this.sendTo(player, { type: 'left_room', reason, code: this.code });
     // The host role moves on in broadcast() (syncHost) now that they are no longer a member.
     if (handedToBot) this.armTimers();
     this.broadcast();
@@ -312,6 +321,8 @@ export class Room {
     if (current !== null) this.vacate(current);
     seat.playerId = player.id;
     this.spectators = this.spectators.filter((id) => id !== player.id);
+    // Seated again: being moved to the spectators is old news.
+    forgetKick(player, this.code);
     this.broadcast();
     return null;
   }
@@ -361,8 +372,10 @@ export class Room {
 
   /**
    * Host removes whoever is at a seat. A bot is removed (lobby only). A human becomes a spectator
-   * in the lobby or between hands (or leaves the room when they are not connected) and is
-   * replaced by a bot during a hand.
+   * in the lobby or between hands and is told so with a `moved_to_spectators` notice; during a
+   * hand they leave the room (`left_room`, reason `kicked`) and a bot takes the seat. A human who
+   * is not connected leaves the room whatever the status. Either way the kick is kept until it
+   * surely arrived, and a player who has not heard about it is told when they return.
    */
   kick(player: Player, seatIndex: number): RoomResult {
     const notHost = this.requireHost(player);
@@ -375,7 +388,7 @@ export class Room {
     const target = this.deps.players.get(seat.playerId);
     if (target === undefined || this.status === 'playing' || target.connections.size === 0) {
       if (target !== undefined) {
-        this.leave(target);
+        this.leave(target, 'kicked');
       } else {
         // A player the registry has forgotten: treat the seat as abandoned.
         if (this.status === 'playing') {
@@ -391,6 +404,9 @@ export class Room {
     this.vacate(seatIndex);
     this.spectators.push(target.id);
     this.broadcast();
+    // After the snapshot, so the client already shows them among the spectators.
+    recordKick(target, this.code, this.deps.clock.now(), 'spectators');
+    this.sendTo(target, { type: 'notice', notice: 'moved_to_spectators', code: this.code });
     return null;
   }
 

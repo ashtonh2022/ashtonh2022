@@ -9,9 +9,10 @@
   "scripts": {
     "dev": "concurrently -k -n server,web -c blue,green \"pnpm --filter @landlord/server dev\" \"pnpm --filter @landlord/web dev\"",
     "build": "pnpm --filter @landlord/web build && pnpm --filter @landlord/server build",
-    "test": "pnpm -r test",
+    "test": "pnpm -r test && node --test \"scripts/*.test.mjs\"",
     "typecheck": "pnpm -r typecheck",
     "e2e": "playwright test",
+    "screenshots": "node scripts/screenshots.mjs",
     "format": "prettier --write .",
     "start": "node apps/server/dist/index.js"
   },

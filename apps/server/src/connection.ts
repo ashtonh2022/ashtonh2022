@@ -54,6 +54,11 @@ export class Connection {
     private readonly handler: ConnectionHandler,
     private readonly clock: Clock,
     private readonly log: Logger,
+    /**
+     * The key per-IP limits count this connection under (see clientIp.ts), worked out by
+     * server.ts from the request; null for in-process transports, which have no IP.
+     */
+    readonly ip: string | null = null,
   ) {}
 
   get isClosed(): boolean {

@@ -22,7 +22,75 @@ export interface Player {
   readonly connections: Set<Connection>;
   /** Epoch ms of recent chat and emote messages, for rate limiting. */
   readonly chatTimes: number[];
+  /**
+   * The host's last kick, until it is sure the player heard about it: it is told again on every
+   * `hello` in the meantime (see Hub). Null when there is nothing to tell.
+   */
+  pendingKick: PendingKick | null;
 }
+
+/**
+ * Where a kick left the player: out of the room (`left_room`, reason `kicked`), or moved from
+ * their seat to the spectators (`notice` moved_to_spectators).
+ */
+export type KickOutcome = 'removed' | 'spectators';
+
+/**
+ * A kick the player may not have heard about. A socket can look open while nothing reaches the
+ * other end (a phone that lost signal, until the heartbeat notices), so sending the message proves
+ * nothing. The kick is kept until every connection it was sent to as it happened has said
+ * something since, which each could only do over a live link, and until then every `hello` of the
+ * player is told. Telling a `hello` proves nothing about the player's other tabs, which each rejoin
+ * the room they were in on their own, so it does not end the kick. Joining or creating a room,
+ * sitting down again or leaving that room does, and so does PENDING_KICK_TTL_MS.
+ */
+export interface PendingKick {
+  /** the room's code */
+  code: string;
+  /** epoch ms of the kick */
+  at: number;
+  outcome: KickOutcome;
+  /**
+   * Connections it was sent to as it happened that have not said anything since. When the last
+   * of them does, it certainly arrived and is forgotten.
+   */
+  readonly awaiting: Set<Connection>;
+  /** One of `awaiting` closed first, so the kick may never have arrived there: keep it. */
+  lost: boolean;
+  /** Connections it has been sent to (it is not repeated on a second `hello` over one). */
+  readonly heardOn: WeakSet<Connection>;
+}
+
+/** Records a kick for `player`, about to be sent to each of their current connections. */
+export function recordKick(
+  player: Player,
+  code: string,
+  at: number,
+  outcome: KickOutcome,
+): PendingKick {
+  const kick: PendingKick = {
+    code,
+    at,
+    outcome,
+    awaiting: new Set(player.connections),
+    lost: false,
+    heardOn: new WeakSet(player.connections),
+  };
+  player.pendingKick = kick;
+  return kick;
+}
+
+/** Forgets the player's pending kick when it is about room `code`. */
+export function forgetKick(player: Player, code: string): void {
+  if (player.pendingKick?.code === code) player.pendingKick = null;
+}
+
+/**
+ * How long a kick the player may not have heard about is remembered for, so they can be told
+ * when they come back (as long as an empty room is kept by default). After that they are
+ * forgotten like anyone else.
+ */
+export const PENDING_KICK_TTL_MS = 120 * 60 * 1000;
 
 /**
  * Characters that draw nothing or reorder the text around them: controls (Cc), format characters
@@ -106,18 +174,30 @@ export class PlayerRegistry {
     return this.add(id, cleaned ?? this.defaultName());
   }
 
-  /** Forgets a player with no connection and no room. True when they were forgotten. */
+  /**
+   * Forgets a player with no connection, no room and no kick to tell them about. True when they
+   * were forgotten.
+   */
   release(player: Player): boolean {
     if (player.connections.size > 0 || player.roomCode !== null) return false;
+    if (player.pendingKick !== null) return false;
     if (this.players.get(player.id) !== player) return false;
     this.players.delete(player.id);
     return true;
   }
 
-  /** Forgets every player with no connection and no room. */
-  sweep(): number {
+  /**
+   * Drops kicks older than PENDING_KICK_TTL_MS nobody came back to hear about, then forgets every
+   * player with no connection, no room and no pending kick.
+   */
+  sweep(now = Date.now()): number {
     let removed = 0;
-    for (const player of [...this.players.values()]) if (this.release(player)) removed++;
+    for (const player of [...this.players.values()]) {
+      if (player.pendingKick !== null && now - player.pendingKick.at >= PENDING_KICK_TTL_MS) {
+        player.pendingKick = null;
+      }
+      if (this.release(player)) removed++;
+    }
     return removed;
   }
 
@@ -129,6 +209,7 @@ export class PlayerRegistry {
       roomCode: null,
       connections: new Set(),
       chatTimes: [],
+      pendingKick: null,
     };
     this.players.set(id, player);
     return player;

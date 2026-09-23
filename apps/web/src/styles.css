@@ -143,6 +143,27 @@ button {
   text-align: center;
 }
 
+/* a notice that stays until closed (kicked from a room, moved to the spectators) */
+.notice-dismissible {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-right: 4px;
+  text-align: left;
+}
+
+.notice-close {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-size: 1.3rem;
+  min-width: var(--tap);
+  min-height: var(--tap);
+  cursor: pointer;
+}
+
 .link {
   color: var(--accent);
   font-weight: 600;

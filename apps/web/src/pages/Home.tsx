@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { NAME_MAX, ROOM_CODE_LENGTH } from '@landlord/protocol';
+import { ROOM_CODE_LENGTH } from '@landlord/protocol';
 
 import { RuleOptions, defaultRules } from '../components/RuleOptions';
-import { StatusBanner, Toast } from '../components/Notices';
+import { NameField } from '../components/NameField';
+import { KickedBanner, StatusBanner, Toast } from '../components/Notices';
 import { client, ensureConnected, send } from '../net/session';
 import { useStore } from '../store';
 import { strings } from '../strings';
@@ -20,19 +21,17 @@ export function normalizeCode(raw: string): string {
 
 export function Home() {
   const navigate = useNavigate();
-  const name = useStore((state) => state.name);
-  const setName = useStore((state) => state.setName);
   const status = useStore((state) => state.status);
   const creating = useStore((state) => state.creating !== null);
   const createdRoom = useStore((state) => state.createdRoom);
   const [rules, setRules] = useState(defaultRules);
   const [code, setCode] = useState('');
-  const nameTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     ensureConnected();
-    if (!useStore.getState().name && client.identity.name) setName(client.identity.name);
-  }, [setName]);
+    // Show a returning player's name at once; the welcome confirms it.
+    if (client.identity.name) useStore.getState().restoreName(client.identity.name);
+  }, []);
 
   // A click is only good for this visit to the page.
   useEffect(() => () => useStore.getState().endCreate(), []);
@@ -51,20 +50,8 @@ export function Home() {
     return () => clearTimeout(timer);
   }, [creating]);
 
-  const flushName = () => {
-    if (nameTimer.current) {
-      clearTimeout(nameTimer.current);
-      nameTimer.current = null;
-    }
-    const current = useStore.getState().name.trim();
-    if (current !== (client.identity.name ?? '')) client.setName(current);
-  };
-
-  const onNameChange = (value: string) => {
-    setName(value.slice(0, NAME_MAX));
-    if (nameTimer.current) clearTimeout(nameTimer.current);
-    nameTimer.current = setTimeout(flushName, 400);
-  };
+  // The client sends a name change once typing pauses (see NameField); these send it now.
+  const flushName = () => client.flushName();
 
   const createRoom = () => {
     flushName();
@@ -85,26 +72,14 @@ export function Home() {
   return (
     <main className="page home">
       <StatusBanner status={status} />
+      <KickedBanner />
       <header className="home-header">
         <h1 className="home-title">{strings.appName}</h1>
         <p className="home-pitch">{strings.pitch}</p>
       </header>
 
       <section className="panel">
-        <label className="field-label" htmlFor="player-name">
-          {strings.yourName}
-        </label>
-        <input
-          id="player-name"
-          className="input"
-          type="text"
-          value={name}
-          maxLength={NAME_MAX}
-          placeholder={strings.namePlaceholder}
-          autoComplete="nickname"
-          onChange={(event) => onNameChange(event.target.value)}
-          onBlur={flushName}
-        />
+        <NameField id="player-name" />
       </section>
 
       <section className="panel" aria-labelledby="create-title">

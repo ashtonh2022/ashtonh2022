@@ -4,12 +4,21 @@
  * 10 s) and re-joins the current room after a reconnect. Messages sent before the server has
  * welcomed us are queued and flushed right after, except actions on the room itself (see
  * LIVE_ONLY): a click made against a table that may be out of date is dropped rather than
- * replayed later.
+ * replayed later. For the same reason the status is 'open' only once the server has welcomed us,
+ * not as soon as the socket opens.
+ *
+ * The name the player typed is the source of truth: it is persisted at once, goes out with the
+ * next hello, and a change made after a hello went out is sent with set_name when the welcome
+ * arrives instead of being replaced by the name in the welcome.
  *
  * Everything environment-specific (socket constructor, storage, URL) is injectable for tests.
  */
 import { PROTOCOL_VERSION, type ClientMessage, type ServerMessage } from '@landlord/protocol';
 
+/**
+ * 'open' once the server has welcomed us on the current socket; until then 'connecting', or
+ * 'reconnecting' when an earlier socket had been welcomed.
+ */
 export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting';
 
 export interface Identity {
@@ -45,10 +54,13 @@ export interface ClientOptions {
   minBackoffMs?: number;
   maxBackoffMs?: number;
   pingIntervalMs?: number;
+  /** how long typing must pause before a name change is sent (see setName) */
+  nameDelayMs?: number;
 }
 
 const SOCKET_OPEN = 1;
 const MAX_QUEUE = 20;
+const NAME_DELAY_MS = 400;
 
 /**
  * Messages aimed at the room as the player last saw it: a seat by its index, the hand on the table,
@@ -134,16 +146,22 @@ export class GameClient {
   private readonly minBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly pingIntervalMs: number;
+  private readonly nameDelayMs: number;
 
   private socket: SocketLike | null = null;
   private started = false;
   private stopped = false;
-  private everOpened = false;
+  private everWelcomed = false;
   private attempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private roomCode: string | null = null;
   private queue: ClientMessage[] = [];
+  private nameTimer: ReturnType<typeof setTimeout> | null = null;
+  /** setName was called after the current socket's hello went out */
+  private nameChangedSinceHello = false;
+  /** the name the server has for us as far as we know: the welcome's, then each one we sent */
+  private serverName: string | null = null;
 
   constructor(options: ClientOptions = {}) {
     this.url = options.url ?? defaultSocketUrl();
@@ -155,6 +173,7 @@ export class GameClient {
     this.minBackoffMs = options.minBackoffMs ?? 1000;
     this.maxBackoffMs = options.maxBackoffMs ?? 10_000;
     this.pingIntervalMs = options.pingIntervalMs ?? 25_000;
+    this.nameDelayMs = options.nameDelayMs ?? NAME_DELAY_MS;
     this.identity = loadIdentity(this.storage);
   }
 
@@ -170,6 +189,7 @@ export class GameClient {
   disconnect(): void {
     this.stopped = true;
     this.clearTimers();
+    this.clearNameTimer();
     const socket = this.socket;
     this.socket = null;
     if (socket) {
@@ -215,12 +235,28 @@ export class GameClient {
     return this.roomCode;
   }
 
-  /** Persists the name for the next hello and tells the server when connected. */
+  /**
+   * The player typed a name (call it on every change). It is persisted at once, so the next hello
+   * carries it, and sent to the server once typing pauses for `nameDelayMs` (or at flushName).
+   * Typed after a hello went out, it replaces the name in the welcome that answers that hello.
+   */
   setName(name: string): void {
-    const trimmed = name.trim();
-    this.identity = { ...this.identity, name: trimmed };
+    this.identity = { ...this.identity, name: name.trim() };
     saveIdentity(this.storage, this.identity);
-    if (trimmed.length > 0 && this.welcomed) this.send({ type: 'set_name', name: trimmed });
+    this.nameChangedSinceHello = true;
+    this.clearNameTimer();
+    this.nameTimer = setTimeout(() => this.flushName(), this.nameDelayMs);
+  }
+
+  /**
+   * Sends a name change still waiting for typing to pause, e.g. before creating or joining a room.
+   * Before the welcome there is nothing to do: the welcome sends it (see handleMessage).
+   */
+  flushName(): void {
+    this.clearNameTimer();
+    const name = this.identity.name ?? '';
+    if (name.length === 0 || !this.welcomed || name === this.serverName) return;
+    if (this.send({ type: 'set_name', name })) this.serverName = name;
   }
 
   private open(): void {
@@ -243,9 +279,9 @@ export class GameClient {
 
   private handleOpen(socket: SocketLike): void {
     if (socket !== this.socket) return;
-    this.everOpened = true;
-    this.setStatus('open');
+    // Not 'open' yet: until the welcome, clicks on the room would be dropped (see send).
     const { playerId, token, name } = this.identity;
+    this.nameChangedSinceHello = false;
     const hello: ClientMessage = {
       type: 'hello',
       protocol: PROTOCOL_VERSION,
@@ -268,14 +304,22 @@ export class GameClient {
     const message = parseServerMessage(data);
     if (!message) return;
     if (message.type === 'welcome') {
+      // A name typed after the hello went out (sent or still waiting for typing to pause) is
+      // newer than the one the server answered with: keep it and tell the server.
+      const typed = this.identity.name ?? '';
+      const keepTyped = this.nameChangedSinceHello && typed.length > 0;
       this.identity = {
         playerId: message.playerId,
         token: message.token,
-        name: message.name,
+        name: keepTyped ? typed : message.name,
       };
       saveIdentity(this.storage, this.identity);
       this.welcomed = true;
+      this.everWelcomed = true;
       this.attempts = 0;
+      this.serverName = message.name;
+      // Before anything else, so a room joined or created next shows the typed name.
+      if (keepTyped) this.flushName();
       if (this.roomCode) {
         socket.send(JSON.stringify({ type: 'join_room', code: this.roomCode }));
       }
@@ -284,6 +328,18 @@ export class GameClient {
       );
       this.queue = [];
       for (const queued of pending) socket.send(JSON.stringify(queued));
+      this.onMessage(message);
+      this.setStatus('open');
+      return;
+    }
+    // Kicked from the room we rejoin on every welcome: stop, or the next welcome walks us back in.
+    // (A player kicked while away hears it just before the welcome, see the server's Hub.hello.)
+    if (
+      message.type === 'left_room' &&
+      message.reason === 'kicked' &&
+      (message.code === undefined || message.code === this.roomCode)
+    ) {
+      this.roomCode = null;
     }
     this.onMessage(message);
   }
@@ -295,7 +351,7 @@ export class GameClient {
     this.queue = this.queue.filter((message) => !LIVE_ONLY.has(message.type));
     this.clearTimers();
     if (this.stopped) return;
-    this.setStatus(this.everOpened ? 'reconnecting' : 'connecting');
+    this.setStatus(this.everWelcomed ? 'reconnecting' : 'connecting');
     this.scheduleReconnect();
   }
 
@@ -317,6 +373,13 @@ export class GameClient {
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
+    }
+  }
+
+  private clearNameTimer(): void {
+    if (this.nameTimer) {
+      clearTimeout(this.nameTimer);
+      this.nameTimer = null;
     }
   }
 

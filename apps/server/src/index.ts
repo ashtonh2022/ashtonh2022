@@ -1,33 +1,34 @@
 import { ENGINE_VERSION } from '@landlord/engine';
 import { PROTOCOL_VERSION } from '@landlord/protocol';
 
-import { DEFAULT_MAX_ROOMS } from './hub';
+import { ConfigError, readConfig, type EnvConfig } from './config';
 import { consoleLogger } from './log';
 import { startServer } from './server';
 
-function envNumber(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === '') return fallback;
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : fallback;
-}
-
 const log = consoleLogger;
-const port = envNumber('PORT', 8080);
-const host = process.env.HOST?.trim() || '0.0.0.0';
-const roomTtlMinutes = envNumber('ROOM_TTL_MINUTES', 120);
-const maxRooms = envNumber('MAX_ROOMS', DEFAULT_MAX_ROOMS);
+
+let config: EnvConfig;
+try {
+  config = readConfig(process.env);
+} catch (err) {
+  if (!(err instanceof ConfigError)) throw err;
+  // Refuse to start rather than run with settings nobody asked for (see readConfig).
+  log.error(`invalid configuration, not starting:\n${err.message}`);
+  process.exit(1);
+}
 
 process.on('unhandledRejection', (reason) => {
   log.error('unhandled rejection', reason);
 });
 
-startServer({ port, host, roomTtlMinutes, maxRooms, log })
+startServer({ ...config, log })
   .then((server) => {
     log.info(
       `landlord server listening on http://${server.host}:${server.port} ` +
         `(engine ${ENGINE_VERSION}, protocol v${PROTOCOL_VERSION}, ` +
-        `room ttl ${roomTtlMinutes} min, max rooms ${maxRooms}, static: ${server.webDist})`,
+        `room ttl ${config.roomTtlMinutes} min, max rooms ${config.maxRooms}, ` +
+        `trust proxy ${server.trustProxy}, per IP: ${server.maxConnectionsPerIp} connections, ` +
+        `${server.maxRoomCreatesPerIp} room creates per 10 min, static: ${server.webDist})`,
     );
     let stopping = false;
     const shutdown = (signal: string): void => {

@@ -2,53 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PROTOCOL_VERSION, type ServerMessage } from '@landlord/protocol';
 
-import { GameClient, IDENTITY_KEY, type SocketLike, type StorageLike } from './client';
-
-class FakeSocket implements SocketLike {
-  readyState = 0;
-  sent: string[] = [];
-  closed = false;
-  onopen: ((event: unknown) => void) | null = null;
-  onclose: ((event: unknown) => void) | null = null;
-  onerror: ((event: unknown) => void) | null = null;
-  onmessage: ((event: { data: unknown }) => void) | null = null;
-
-  send(data: string): void {
-    this.sent.push(data);
-  }
-
-  close(): void {
-    this.closed = true;
-  }
-
-  open(): void {
-    this.readyState = 1;
-    this.onopen?.({});
-  }
-
-  receive(message: ServerMessage | Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify(message) });
-  }
-
-  drop(): void {
-    this.readyState = 3;
-    this.onclose?.({});
-  }
-
-  parsed(): Array<Record<string, unknown>> {
-    return this.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>);
-  }
-}
-
-class MemoryStorage implements StorageLike {
-  private readonly map = new Map<string, string>();
-  getItem(key: string): string | null {
-    return this.map.get(key) ?? null;
-  }
-  setItem(key: string, value: string): void {
-    this.map.set(key, value);
-  }
-}
+import { FakeSocket, MemoryStorage } from '../test/fakeSocket';
+import { GameClient, IDENTITY_KEY } from './client';
 
 const welcome: ServerMessage = {
   type: 'welcome',
@@ -95,13 +50,16 @@ describe('GameClient', () => {
     if (!socket) return;
 
     socket.open();
-    expect(client.status).toBe('open');
-    expect(onStatus).toHaveBeenCalledWith('open');
+    // the socket is open but the server has not accepted us yet
+    expect(client.status).toBe('connecting');
+    expect(onStatus).not.toHaveBeenCalled();
     expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION });
 
     socket.receive({ type: 'hello' }); // the stub server's greeting is ignored
     socket.receive(welcome);
     expect(client.welcomed).toBe(true);
+    expect(client.status).toBe('open');
+    expect(onStatus).toHaveBeenCalledWith('open');
     expect(onMessage).toHaveBeenCalledWith(welcome);
     expect(JSON.parse(storage.getItem(IDENTITY_KEY) ?? '{}')).toEqual({
       playerId: 'p1',
@@ -156,7 +114,8 @@ describe('GameClient', () => {
     const second = sockets[1];
     if (!second) throw new Error('no second socket');
     second.open();
-    expect(client.status).toBe('open');
+    // still reconnecting until the server welcomes us on the new socket
+    expect(client.status).toBe('reconnecting');
     expect(second.parsed()[0]).toEqual({
       type: 'hello',
       protocol: PROTOCOL_VERSION,
@@ -165,6 +124,7 @@ describe('GameClient', () => {
       name: 'Ada',
     });
     second.receive(welcome);
+    expect(client.status).toBe('open');
     expect(second.parsed()[1]).toEqual({ type: 'join_room', code: 'ABC123' });
 
     // a welcome resets the backoff: 1 s again, then it doubles while attempts keep failing
@@ -310,5 +270,286 @@ describe('GameClient', () => {
       token: 't9',
       name: 'Yan',
     });
+  });
+});
+
+describe('GameClient: the connection counts as open only after the welcome', () => {
+  const sockets: FakeSocket[] = [];
+  const createSocket = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    return socket;
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sockets.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function socketAt(index: number): FakeSocket {
+    const socket = sockets[index];
+    if (!socket) throw new Error(`no socket ${index}`);
+    return socket;
+  }
+
+  it('stays connecting while the socket is open but the server has not welcomed us', () => {
+    const statuses: string[] = [];
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage: new MemoryStorage(),
+      onStatus: (status) => statuses.push(status),
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    expect(client.status).toBe('connecting');
+    socketAt(0).open();
+    expect(client.status).toBe('connecting');
+    expect(statuses).toEqual([]);
+    socketAt(0).receive(welcome);
+    expect(client.status).toBe('open');
+    expect(statuses).toEqual(['open']);
+    client.disconnect();
+  });
+
+  it('stays reconnecting after a drop until the new socket is welcomed', () => {
+    const statuses: string[] = [];
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage: new MemoryStorage(),
+      onStatus: (status) => statuses.push(status),
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    socketAt(0).open();
+    socketAt(0).receive(welcome);
+    socketAt(0).drop();
+    expect(client.status).toBe('reconnecting');
+    vi.advanceTimersByTime(1000);
+    socketAt(1).open();
+    expect(client.status).toBe('reconnecting');
+    socketAt(1).receive(welcome);
+    expect(client.status).toBe('open');
+    expect(statuses).toEqual(['open', 'reconnecting', 'open']);
+    client.disconnect();
+  });
+
+  it('is still connecting when a first socket closes before any welcome', () => {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage: new MemoryStorage(),
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    socketAt(0).open();
+    socketAt(0).drop();
+    expect(client.status).toBe('connecting');
+    client.disconnect();
+  });
+});
+
+describe('GameClient: the name the player typed wins over the welcome', () => {
+  const sockets: FakeSocket[] = [];
+  let storage: MemoryStorage;
+  const createSocket = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    return socket;
+  };
+  const serverDefault: ServerMessage = { ...welcome, name: 'Player 1234' };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sockets.length = 0;
+    storage = new MemoryStorage();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function connected(): { client: GameClient; socket: FakeSocket } {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage,
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    const socket = sockets[0];
+    if (!socket) throw new Error('no socket');
+    return { client, socket };
+  }
+
+  function stored(): unknown {
+    return JSON.parse(storage.getItem(IDENTITY_KEY) ?? '{}');
+  }
+
+  it.each([
+    ['still waiting for typing to pause', 0],
+    ['already flushed to the client', 400],
+  ])('keeps a name typed after the hello went out (%s) and sends it', (_label, waitMs) => {
+    const { client, socket } = connected();
+    socket.open();
+    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION });
+    client.setName('Bob');
+    vi.advanceTimersByTime(waitMs);
+    socket.receive(serverDefault);
+    expect(socket.parsed()).toEqual([
+      { type: 'hello', protocol: PROTOCOL_VERSION },
+      { type: 'set_name', name: 'Bob' },
+    ]);
+    expect(client.identity).toEqual({ playerId: 'p1', token: 't1', name: 'Bob' });
+    expect(stored()).toEqual({ playerId: 'p1', token: 't1', name: 'Bob' });
+    // the change is delivered: nothing more goes out when the typing pause would have ended
+    vi.advanceTimersByTime(1000);
+    expect(socket.types()).toEqual(['hello', 'set_name']);
+    client.disconnect();
+  });
+
+  it('sends the typed name before a room queued before the welcome is created', () => {
+    const { client, socket } = connected();
+    socket.open();
+    client.setName('Bob');
+    client.flushName();
+    client.send({ type: 'ping' });
+    client.send({ type: 'create_room', rules: {} });
+    socket.receive(serverDefault);
+    expect(socket.types()).toEqual(['hello', 'set_name', 'ping', 'create_room']);
+    client.disconnect();
+  });
+
+  it('puts a name typed before the socket opened into the hello', () => {
+    const { client, socket } = connected();
+    client.setName('Bob');
+    socket.open();
+    expect(socket.parsed()[0]).toEqual({ type: 'hello', protocol: PROTOCOL_VERSION, name: 'Bob' });
+    socket.receive({ ...welcome, name: 'Bob' });
+    expect(socket.types()).toEqual(['hello']);
+    expect(stored()).toEqual({ playerId: 'p1', token: 't1', name: 'Bob' });
+    client.disconnect();
+  });
+
+  it("adopts the server's name when nothing was typed", () => {
+    const { client, socket } = connected();
+    socket.open();
+    socket.receive(serverDefault);
+    expect(socket.types()).toEqual(['hello']);
+    expect(client.identity.name).toBe('Player 1234');
+    expect(stored()).toEqual({ playerId: 'p1', token: 't1', name: 'Player 1234' });
+    client.disconnect();
+  });
+
+  it("keeps a returning player's stored name", () => {
+    storage.setItem(IDENTITY_KEY, JSON.stringify({ playerId: 'p1', token: 't1', name: 'Zed' }));
+    const { client, socket } = connected();
+    socket.open();
+    expect(socket.parsed()[0]).toEqual({
+      type: 'hello',
+      protocol: PROTOCOL_VERSION,
+      playerId: 'p1',
+      token: 't1',
+      name: 'Zed',
+    });
+    socket.receive({ ...welcome, name: 'Zed' });
+    expect(socket.types()).toEqual(['hello']);
+    expect(stored()).toEqual({ playerId: 'p1', token: 't1', name: 'Zed' });
+    client.disconnect();
+  });
+
+  it('sends a name change once typing pauses after the welcome', () => {
+    const { client, socket } = connected();
+    socket.open();
+    socket.receive(serverDefault);
+    client.setName('B');
+    client.setName('Bo');
+    vi.advanceTimersByTime(399);
+    expect(socket.types()).toEqual(['hello']);
+    vi.advanceTimersByTime(1);
+    expect(socket.parsed().slice(1)).toEqual([{ type: 'set_name', name: 'Bo' }]);
+    // flushing again with nothing new sends nothing
+    client.flushName();
+    expect(socket.types()).toEqual(['hello', 'set_name']);
+    client.disconnect();
+  });
+});
+
+describe('GameClient: a room the host kicked the player from is not rejoined', () => {
+  const sockets: FakeSocket[] = [];
+  const createSocket = () => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    return socket;
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sockets.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function socketAt(index: number): FakeSocket {
+    const socket = sockets[index];
+    if (!socket) throw new Error(`no socket ${index}`);
+    return socket;
+  }
+
+  function makeClient(): GameClient {
+    const client = new GameClient({
+      url: 'ws://test/ws',
+      createSocket,
+      storage: new MemoryStorage(),
+      pingIntervalMs: 0,
+    });
+    client.connect();
+    return client;
+  }
+
+  it('does not walk back into it when the kick is reported before the welcome', () => {
+    // Kicked while away: the server tells the player on their next hello, before welcoming them.
+    const client = makeClient();
+    client.joinRoom('ABCDEF');
+    socketAt(0).open();
+    socketAt(0).receive({ type: 'left_room', reason: 'kicked', code: 'ABCDEF' });
+    socketAt(0).receive(welcome);
+    expect(socketAt(0).types()).toEqual(['hello']);
+    expect(client.currentRoomCode).toBeNull();
+    client.disconnect();
+  });
+
+  it('does not rejoin it after a reconnect when kicked while connected', () => {
+    const client = makeClient();
+    socketAt(0).open();
+    socketAt(0).receive(welcome);
+    client.joinRoom('ABCDEF');
+    expect(socketAt(0).types()).toEqual(['hello', 'join_room']);
+    socketAt(0).receive({ type: 'left_room', reason: 'kicked', code: 'ABCDEF' });
+    socketAt(0).drop();
+    vi.advanceTimersByTime(1000);
+    socketAt(1).open();
+    socketAt(1).receive(welcome);
+    expect(socketAt(1).types()).toEqual(['hello']);
+    client.disconnect();
+  });
+
+  it('still rejoins after a plain leave or a kick from another room', () => {
+    const client = makeClient();
+    client.joinRoom('ABCDEF');
+    socketAt(0).open();
+    socketAt(0).receive({ type: 'left_room', reason: 'kicked', code: 'OTHER1' });
+    socketAt(0).receive({ type: 'left_room', reason: 'left', code: 'ABCDEF' });
+    socketAt(0).receive({ type: 'left_room' });
+    socketAt(0).receive(welcome);
+    expect(socketAt(0).parsed().slice(1)).toEqual([{ type: 'join_room', code: 'ABCDEF' }]);
+    client.disconnect();
   });
 });

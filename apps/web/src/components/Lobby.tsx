@@ -7,6 +7,7 @@ import { send } from '../net/session';
 import { useStore } from '../store';
 import { strings } from '../strings';
 import { EmoteBubble } from './EmoteBubble';
+import { NameField } from './NameField';
 import { ResultPanel } from './ResultPanel';
 import { RuleChips } from './RuleChips';
 import { RuleOptions } from './RuleOptions';
@@ -116,6 +117,12 @@ export function Lobby({ room }: { room: RoomView }) {
     setEditing(false);
   };
 
+  const namePanel = (
+    <section className="panel">
+      <NameField id="lobby-name" />
+    </section>
+  );
+
   return (
     <div className="lobby">
       {showResult && room.lastResult && (
@@ -169,7 +176,12 @@ export function Lobby({ room }: { room: RoomView }) {
         )}
       </section>
 
+      {/* A guest who came by the share link names themselves here; the host shares the link. */}
+      {!isHost && namePanel}
+
       <SharePanel code={room.code} />
+
+      {isHost && namePanel}
 
       <section className="panel" aria-labelledby="rules-title">
         <h2 id="rules-title" className="panel-title">

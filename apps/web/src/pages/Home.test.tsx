@@ -4,13 +4,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const send = vi.fn();
 vi.mock('../net/session', () => ({
-  client: { identity: {}, setName: vi.fn(), joinRoom: vi.fn() },
+  client: { identity: {}, setName: vi.fn(), flushName: vi.fn(), joinRoom: vi.fn() },
   ensureConnected: vi.fn(),
   send: (message: unknown) => send(message),
 }));
 
 import { useStore } from '../store';
 import { resetStore, roomView } from '../test/fixtures';
+import { App } from '../App';
 import { Home, normalizeCode } from './Home';
 
 function Where() {
@@ -149,5 +150,52 @@ describe('Home', () => {
     });
     expect(screen.getByRole('button', { name: 'Create room' })).toBeEnabled();
     expect(screen.queryByTestId('where')).toBeNull();
+  });
+});
+
+describe('Home: removed by the host', () => {
+  const banner = 'The host removed you from room OLDOLD.';
+
+  beforeEach(() => {
+    resetStore();
+    send.mockClear();
+    receive({ type: 'room_state', room: roomView(null, { code: 'OLDOLD', seat: 1 }) });
+    receive({ type: 'left_room', reason: 'kicked', code: 'OLDOLD' });
+  });
+
+  it('shows why the player is back home', () => {
+    renderHome();
+    expect(screen.getByRole('alert')).toHaveTextContent(banner);
+  });
+
+  it('clears the banner when the player creates a room', () => {
+    renderWithRoutes();
+    expect(screen.getByRole('alert')).toHaveTextContent(banner);
+    fireEvent.click(screen.getByRole('button', { name: 'Create room' }));
+    expect(screen.queryByText(banner)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('clears the banner when the player joins a room', () => {
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(banner);
+    fireEvent.change(screen.getByLabelText('Room code'), { target: { value: 'NEWNEW' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Join' }));
+    expect(screen.getByText('Joining room NEWNEW...')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('link', { name: 'Back to the home page' }));
+    expect(screen.getByRole('heading', { name: 'Create a room' })).toBeInTheDocument();
+    expect(screen.queryByText(banner)).toBeNull();
+  });
+
+  it('uses the room it had when the server does not say which room it was', () => {
+    resetStore();
+    receive({ type: 'room_state', room: roomView(null, { code: 'ROOMXY', seat: 1 }) });
+    receive({ type: 'left_room', reason: 'kicked' });
+    renderHome();
+    expect(screen.getByRole('alert')).toHaveTextContent('The host removed you from room ROOMXY.');
   });
 });

@@ -14,8 +14,9 @@ export interface Player {
 }
 
 /**
- * Opens the home page in a fresh context and sets the player's name. Waits for the server's
- * welcome first (it fills in a default name), so the typed name is not overwritten by it.
+ * Opens the home page in a fresh context and types the player's name straight away, as a person
+ * would: usually before the server has welcomed the new connection, whose default name must not
+ * replace the typed one.
  */
 export async function openPlayer(
   browser: Browser,
@@ -26,7 +27,6 @@ export async function openPlayer(
   const page = await context.newPage();
   await page.goto('/');
   const input = page.getByLabel('Your name');
-  await expect(input).not.toHaveValue('', { timeout: 20_000 });
   await input.fill(name);
   await input.blur();
   return { name, context, page };

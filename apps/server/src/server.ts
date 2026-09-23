@@ -4,7 +4,8 @@ import type { Duplex } from 'node:stream';
 
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { Hub } from './hub';
+import { clientIpKey, DEFAULT_TRUST_PROXY } from './clientIp';
+import { DEFAULT_MAX_ROOM_CREATES_PER_IP, Hub } from './hub';
 import { consoleLogger, type Logger } from './log';
 import { DEFAULT_ROOM_TTL_MS } from './rooms';
 import { createStaticHandler, resolveWebDist } from './static';
@@ -22,7 +23,22 @@ export interface ServerOptions {
   heartbeatMs?: number;
   /** Most rooms held at once (see HubOptions.maxRooms). Default 500. */
   maxRooms?: number;
+  /**
+   * Reverse proxies in front of the server, which decides whose X-Forwarded-For entries are
+   * believed (see clientIp.ts). 0 ignores the header. Default 0.
+   */
+  trustProxy?: number;
+  /** Open WebSockets allowed per client IP (an IPv6 /64 counts as one IP). Default 20. */
+  maxConnectionsPerIp?: number;
+  /** create_room allowed per client IP per 10 minutes (see HubOptions). Default 10. */
+  maxRoomCreatesPerIp?: number;
 }
+
+/**
+ * Open WebSockets allowed per IP unless configured otherwise (env MAX_CONNECTIONS_PER_IP).
+ * Generous, because friends behind one home or campus network share an address.
+ */
+export const DEFAULT_MAX_CONNECTIONS_PER_IP = 20;
 
 export interface RunningServer {
   port: number;
@@ -30,6 +46,10 @@ export interface RunningServer {
   webDist: string;
   hub: Hub;
   httpServer: Server;
+  /** The per-IP settings in force, after defaults and clamping. */
+  trustProxy: number;
+  maxConnectionsPerIp: number;
+  maxRoomCreatesPerIp: number;
   close(): Promise<void>;
 }
 
@@ -40,6 +60,13 @@ export function requestPath(url: string | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+/** A whole number of at least `min`, or undefined when `value` is missing or not a number. */
+function wholeAtLeast(value: number | undefined, min: number): number | undefined {
+  return value !== undefined && Number.isFinite(value)
+    ? Math.max(min, Math.floor(value))
+    : undefined;
 }
 
 /** Answers an upgrade request with a plain HTTP error and closes the socket. */
@@ -64,11 +91,13 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     options.roomTtlMinutes !== undefined && Number.isFinite(options.roomTtlMinutes)
       ? Math.max(1, options.roomTtlMinutes) * 60 * 1000
       : DEFAULT_ROOM_TTL_MS;
-  const maxRooms =
-    options.maxRooms !== undefined && Number.isFinite(options.maxRooms)
-      ? Math.max(1, Math.floor(options.maxRooms))
-      : undefined;
-  const hub = new Hub({ log, roomTtlMs, maxRooms });
+  const maxRooms = wholeAtLeast(options.maxRooms, 1);
+  const trustProxy = wholeAtLeast(options.trustProxy, 0) ?? DEFAULT_TRUST_PROXY;
+  const maxConnectionsPerIp =
+    wholeAtLeast(options.maxConnectionsPerIp, 1) ?? DEFAULT_MAX_CONNECTIONS_PER_IP;
+  const maxRoomCreatesPerIp =
+    wholeAtLeast(options.maxRoomCreatesPerIp, 1) ?? DEFAULT_MAX_ROOM_CREATES_PER_IP;
+  const hub = new Hub({ log, roomTtlMs, maxRooms, maxRoomCreatesPerIp });
   hub.start();
 
   const httpServer = createServer((req, res) => {
@@ -98,20 +127,25 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
   const alive = new WeakSet<WebSocket>();
+  /** Sockets per IP key from their upgrade request until they close, handshake or not. */
+  const openPerIp = new Map<string, number>();
 
-  wss.on('connection', (socket) => {
+  const accept = (socket: WebSocket, ip: string): void => {
     alive.add(socket);
-    const connection = hub.connect({
-      send: (data) => socket.send(data),
-      close: (code, reason) => socket.close(code, reason),
-    });
+    const connection = hub.connect(
+      {
+        send: (data) => socket.send(data),
+        close: (code, reason) => socket.close(code, reason),
+      },
+      ip,
+    );
     socket.on('message', (data, isBinary) => connection.receive(isBinary ? null : data));
     socket.on('pong', () => alive.add(socket));
     socket.on('close', () => connection.handleClose());
     socket.on('error', (err) => {
       log.warn(`connection ${connection.id}: socket error`, err.message);
     });
-  });
+  };
 
   // Nothing may throw out of this listener: an exception here would take the whole process down.
   httpServer.on('upgrade', (req, socket, head) => {
@@ -125,9 +159,23 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
         socket.destroy();
         return;
       }
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit('connection', ws, req);
+      // Already gone: its 'close' may have fired, so it must not take a slot it would never free.
+      if (socket.destroyed) return;
+      const ip = clientIpKey(req.headers['x-forwarded-for'], req.socket.remoteAddress, trustProxy);
+      const open = openPerIp.get(ip) ?? 0;
+      if (open >= maxConnectionsPerIp) {
+        rejectUpgrade(socket, 429, 'Too Many Requests');
+        return;
+      }
+      // The slot is taken before the handshake (so parallel upgrades cannot overshoot) and freed
+      // when the raw socket closes, which covers failed handshakes as well as closed WebSockets.
+      openPerIp.set(ip, open + 1);
+      socket.once('close', () => {
+        const left = (openPerIp.get(ip) ?? 1) - 1;
+        if (left > 0) openPerIp.set(ip, left);
+        else openPerIp.delete(ip);
       });
+      wss.handleUpgrade(req, socket, head, (ws) => accept(ws, ip));
     } catch (err) {
       log.warn('upgrade request failed', err);
       socket.destroy();
@@ -162,7 +210,17 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     httpServer.listen(options.port ?? 8080, host, () => {
       httpServer.off('error', reject);
       const address = httpServer.address() as AddressInfo;
-      resolve({ port: address.port, host, webDist, hub, httpServer, close });
+      resolve({
+        port: address.port,
+        host,
+        webDist,
+        hub,
+        httpServer,
+        trustProxy,
+        maxConnectionsPerIp,
+        maxRoomCreatesPerIp,
+        close,
+      });
     });
   });
 }

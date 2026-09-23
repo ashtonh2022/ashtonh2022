@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../net/session', () => ({
-  client: { identity: {}, setName: vi.fn(), joinRoom: vi.fn() },
+  client: { identity: {}, setName: vi.fn(), flushName: vi.fn(), joinRoom: vi.fn() },
   ensureConnected: vi.fn(),
   send: vi.fn(),
 }));
@@ -70,5 +70,28 @@ describe('Lobby while the connection is down', () => {
     render(<Lobby room={room} />);
     expect(screen.getByRole('button', { name: 'Remove' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Start hand' })).toBeDisabled();
+  });
+});
+
+describe('Lobby name field', () => {
+  beforeEach(() => {
+    resetStore();
+  });
+
+  /** True when the "Your name" field comes before the invite link on the page. */
+  function nameBeforeInvite(): boolean {
+    const name = screen.getByLabelText('Your name');
+    const invite = screen.getByRole('heading', { name: 'Invite friends' });
+    return Boolean(name.compareDocumentPosition(invite) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+
+  it('comes right after the seats for a guest, who arrived by the link and has a name to give', () => {
+    render(<Lobby room={roomView(null, { seat: null })} />);
+    expect(nameBeforeInvite()).toBe(true);
+  });
+
+  it('comes after the invite link for the host, whose first job is to share it', () => {
+    render(<Lobby room={roomView(null, { seat: 0, hostSeat: 0 })} />);
+    expect(nameBeforeInvite()).toBe(false);
   });
 });

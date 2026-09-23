@@ -4,7 +4,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ChatPanel } from '../components/Chat';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Lobby } from '../components/Lobby';
-import { StatusBanner, Toast } from '../components/Notices';
+import { RoomNoticeBanner, StatusBanner, Toast } from '../components/Notices';
 import { Table } from '../components/Table';
 import { TopBar } from '../components/TopBar';
 import { fmt } from '../lib/format';
@@ -40,6 +40,7 @@ export function Room() {
   const roomNotFound = useStore((state) => state.roomNotFound);
   const joinError = useStore((state) => state.joinError);
   const status = useStore((state) => state.status);
+  const kickedFrom = useStore((state) => state.kickedFrom);
   const hadRoom = useRef(false);
   /** hand number the Leave confirmation was asked for */
   const [confirmLeaveFor, setConfirmLeaveFor] = useState<number | null>(null);
@@ -55,15 +56,21 @@ export function Room() {
     };
   }, [code]);
 
-  // Kicked or the room closed: go home.
+  // Kicked or the room closed: go home (Home says why when the host removed us). A kick from this
+  // room counts even before it showed: the link reopened after the host removed us while away.
   useEffect(() => {
     if (room && room.code === code) {
       hadRoom.current = true;
-    } else if (room === null && hadRoom.current) {
+      return;
+    }
+    if (room !== null) return;
+    // Read fresh: opening the page (beginJoin, above) has just cleared an older kick.
+    const kickedHere = useStore.getState().kickedFrom?.code === code;
+    if (hadRoom.current || kickedHere) {
       hadRoom.current = false;
       navigate('/');
     }
-  }, [room, code, navigate]);
+  }, [room, code, navigate, kickedFrom]);
 
   const leave = () => {
     setConfirmLeaveFor(null);
@@ -140,6 +147,7 @@ export function Room() {
       <TopBar code={room.code} onLeave={requestLeave} />
       <StatusBanner status={status} />
       <main className={playing ? 'room-main room-playing' : 'room-main page'}>
+        <RoomNoticeBanner code={room.code} />
         {playing && room.hand ? <Table room={room} hand={room.hand} /> : <Lobby room={room} />}
       </main>
       <ChatPanel room={room} />

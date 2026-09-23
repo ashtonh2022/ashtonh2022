@@ -3,7 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('./net/session', () => ({
-  client: { identity: {}, setName: vi.fn(), joinRoom: vi.fn() },
+  client: { identity: {}, setName: vi.fn(), flushName: vi.fn(), joinRoom: vi.fn() },
   ensureConnected: vi.fn(),
   send: vi.fn(),
 }));

@@ -7,14 +7,14 @@ import {
   within,
 } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const session = vi.hoisted(() => ({
   send: vi.fn(),
   joinRoom: vi.fn(),
 }));
 vi.mock('../net/session', () => ({
-  client: { identity: {}, setName: vi.fn(), joinRoom: session.joinRoom },
+  client: { identity: {}, setName: vi.fn(), flushName: vi.fn(), joinRoom: session.joinRoom },
   ensureConnected: vi.fn(),
   send: (message: unknown) => session.send(message),
 }));
@@ -143,5 +143,77 @@ describe('Toasts (W5)', () => {
     render(<Toast />);
     expect(screen.queryByText('old news')).toBeNull();
     expect(useStore.getState().lastError).toBeNull();
+  });
+});
+
+describe('Removed by the host', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStore();
+    useStore.setState({ status: 'open' });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function renderApp(path = '/room/ABCDEF') {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <App />
+      </MemoryRouter>,
+    );
+  }
+
+  it('sends a kicked player home and tells them why until they dismiss it', () => {
+    renderApp();
+    receive({ type: 'room_state', room: roomView(firstBidderCalls(newHand()), { seat: 1 }) });
+    receive({ type: 'left_room', reason: 'kicked', code: 'ABCDEF' });
+    expect(screen.getByRole('heading', { name: 'Create a room' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('The host removed you from room ABCDEF.');
+    // not a toast: it outlives the page change clean-up and any toast timeout
+    reactAct(() => vi.advanceTimersByTime(60_000));
+    expect(screen.getByRole('alert')).toHaveTextContent('The host removed you from room ABCDEF.');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(/The host removed you/)).toBeNull();
+  });
+
+  it.each([
+    ['without a reason', { type: 'left_room' } as const],
+    ['that says they left', { type: 'left_room', reason: 'left', code: 'ABCDEF' } as const],
+  ])('shows nothing on the home page for a plain left_room %s', (_label, message) => {
+    renderApp();
+    receive({ type: 'room_state', room: roomView(null) });
+    receive(message);
+    expect(screen.getByRole('heading', { name: 'Create a room' })).toBeInTheDocument();
+    reactAct(() => vi.advanceTimersByTime(1000));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(/The host removed you/)).toBeNull();
+  });
+
+  it('tells a player the host moved them to the spectators until they dismiss it', () => {
+    renderApp();
+    receive({ type: 'room_state', room: roomView(null, { seat: 1 }) });
+    receive({ type: 'room_state', room: roomView(null, { seat: null }) });
+    receive({ type: 'notice', notice: 'moved_to_spectators', code: 'ABCDEF' });
+    const text =
+      'The host moved you to the spectators. You can take a seat again when one is free.';
+    expect(screen.getByRole('heading', { name: 'Seats' })).toBeInTheDocument();
+    expect(screen.getByText(text)).toBeInTheDocument();
+    reactAct(() => vi.advanceTimersByTime(60_000));
+    receive({ type: 'room_state', room: roomView(null, { seat: null }) });
+    expect(screen.getByText(text)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(text)).toBeNull();
+  });
+
+  it('drops the spectators notice once the player has a seat again', () => {
+    renderApp();
+    receive({ type: 'room_state', room: roomView(null, { seat: null }) });
+    receive({ type: 'notice', notice: 'moved_to_spectators', code: 'ABCDEF' });
+    expect(screen.getByText(/The host moved you to the spectators/)).toBeInTheDocument();
+    receive({ type: 'room_state', room: roomView(null, { seat: 2 }) });
+    expect(screen.queryByText(/The host moved you to the spectators/)).toBeNull();
   });
 });

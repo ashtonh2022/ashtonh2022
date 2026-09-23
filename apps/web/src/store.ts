@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import type {
   ChatEntry,
   Emote,
+  NoticeCode,
   RoomView,
   ServerErrorCode,
   ServerMessage,
@@ -27,6 +28,12 @@ export interface EmoteBubble {
   at: number;
 }
 
+/** A one-off notice from the server about the room we are in. */
+export interface RoomNotice {
+  notice: NoticeCode;
+  code: string;
+}
+
 export const EMOTE_BUBBLE_MS = 2500;
 export const BIDDING_LOG_LINGER_MS = 4000;
 /** the "New cards were dealt" notice stays at least this long after a redeal */
@@ -39,7 +46,13 @@ export interface StoreState {
   /** code of the most recent room_state, kept when `room` is cleared (see Home's create flow) */
   lastRoomCode: string | null;
   lastError: UiError | null;
+  /** the name field on Home */
   name: string;
+  /**
+   * true when the player typed in the name field since the last welcome: that welcome then keeps
+   * what they typed instead of showing the server's name (the client sends it, see GameClient)
+   */
+  nameTyped: boolean;
   muted: boolean;
   selection: string[];
   hintIndex: number;
@@ -60,10 +73,20 @@ export interface StoreState {
   creating: PendingCreate | null;
   /** the room the last Create click made; Home goes there */
   createdRoom: string | null;
+  /**
+   * The host removed us from a room (code null when nobody said which). Home says so until the
+   * player dismisses it or creates or joins a room.
+   */
+  kickedFrom: { code: string | null } | null;
+  /** a one-off notice about the room we are in, shown by the Room page until dismissed */
+  roomNotice: RoomNotice | null;
 
   setStatus(status: ConnectionStatus): void;
   handleMessage(message: ServerMessage): void;
+  /** the player typed in the name field */
   setName(name: string): void;
+  /** fills an empty name field with the persisted name; not typing, so a welcome may replace it */
+  restoreName(name: string): void;
   setMuted(muted: boolean): void;
   toggleCard(id: string): void;
   setSelection(ids: string[]): void;
@@ -71,6 +94,8 @@ export interface StoreState {
   setHintIndex(index: number): void;
   setChatOpen(open: boolean): void;
   dismissError(): void;
+  dismissKicked(): void;
+  dismissRoomNotice(): void;
   clearRoom(): void;
   /** the Room page starts (or retries) joining `code` */
   beginJoin(code: string): void;
@@ -103,6 +128,7 @@ const NO_ROOM = {
   unreadChat: 0,
   landlordChosenAt: null,
   redealAt: null,
+  roomNotice: null,
 } satisfies Partial<StoreState>;
 
 /** Both snapshots show the same deal of the same room (not a new hand, not a redeal). */
@@ -137,6 +163,7 @@ export const useStore = create<StoreState>((set, get) => ({
   lastRoomCode: null,
   lastError: null,
   name: '',
+  nameTyped: false,
   muted: loadMuted(),
   selection: [],
   hintIndex: 0,
@@ -150,6 +177,8 @@ export const useStore = create<StoreState>((set, get) => ({
   redealAt: null,
   creating: null,
   createdRoom: null,
+  kickedFrom: null,
+  roomNotice: null,
 
   setStatus(status) {
     set({ status });
@@ -161,7 +190,8 @@ export const useStore = create<StoreState>((set, get) => ({
       case 'welcome': {
         set({
           you: { playerId: message.playerId, name: message.name },
-          name: state.name || message.name,
+          name: state.nameTyped ? state.name : message.name,
+          nameTyped: false,
         });
         return;
       }
@@ -194,9 +224,17 @@ export const useStore = create<StoreState>((set, get) => ({
           creating = null;
           createdRoom = next.code;
         }
+        // The spectators notice is done once we are seated again or somewhere else.
+        const roomNotice =
+          state.roomNotice !== null &&
+          state.roomNotice.code === next.code &&
+          !(state.roomNotice.notice === 'moved_to_spectators' && next.you.seat !== null)
+            ? state.roomNotice
+            : null;
         set({
           creating,
           createdRoom,
+          roomNotice,
           room: next,
           lastRoomCode: next.code,
           // a broadcast from another room (the server re-attached us to it) ends no join state
@@ -217,8 +255,17 @@ export const useStore = create<StoreState>((set, get) => ({
       }
       case 'left_room': {
         // The Room page may still be joining another room (joining one leaves the old one first),
-        // so the join bookkeeping stays.
-        set(NO_ROOM);
+        // so the join bookkeeping stays. The Room page sends the player home; Home says why when
+        // the host removed them.
+        const kickedFrom =
+          message.reason === 'kicked'
+            ? { code: message.code ?? state.room?.code ?? state.lastRoomCode }
+            : state.kickedFrom;
+        set({ ...NO_ROOM, kickedFrom });
+        return;
+      }
+      case 'notice': {
+        set({ roomNotice: { notice: message.notice, code: message.code } });
         return;
       }
       case 'chat': {
@@ -273,7 +320,11 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   setName(name) {
-    set({ name });
+    set({ name, nameTyped: true });
+  },
+
+  restoreName(name) {
+    if (get().name === '') set({ name });
   },
 
   setMuted(muted) {
@@ -311,18 +362,26 @@ export const useStore = create<StoreState>((set, get) => ({
     set({ lastError: null });
   },
 
+  dismissKicked() {
+    set({ kickedFrom: null });
+  },
+
+  dismissRoomNotice() {
+    set({ roomNotice: null });
+  },
+
   clearRoom() {
     set({ ...NO_ROOM, joinTarget: null, joinError: null });
   },
 
   beginJoin(code) {
-    set({ joinTarget: code, joinError: null, roomNotFound: false });
+    set({ joinTarget: code, joinError: null, roomNotFound: false, kickedFrom: null });
   },
 
   beginCreate() {
     const { room, lastRoomCode } = get();
     const stale = [room?.code, lastRoomCode].filter((code): code is string => Boolean(code));
-    set({ creating: { answered: false, stale }, createdRoom: null });
+    set({ creating: { answered: false, stale }, createdRoom: null, kickedFrom: null });
   },
 
   endCreate() {
