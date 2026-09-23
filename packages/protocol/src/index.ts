@@ -3,6 +3,11 @@
  * zod schemas validate everything the client sends. Types for server -> client messages are plain.
  * The server is authoritative: the client never runs the state machine, it only renders RoomView
  * and uses the engine for local helpers (sorting, analysing a selection, hints).
+ *
+ * Changes since the first version (all backwards compatible, PROTOCOL_VERSION unchanged):
+ * - RoomView.acting: the seats the current deadline applies to. In the doubling round this tells
+ *   everyone who is still deciding without revealing anyone's choice.
+ * - RoomView.redealt: true on the first snapshot after everyone passed and the cards were redealt.
  */
 import { z } from 'zod';
 import type { HandAction, HandResult, HandView, RuleSettings } from '@landlord/engine';
@@ -121,6 +126,13 @@ export interface RoomView {
   lastResult: HandResult | null;
   /** epoch ms when the current decision times out, null when no timer is running */
   deadline: number | null;
+  /**
+   * Seats whose decision the deadline applies to: the seat on turn, or during the doubling round
+   * every seat that has not decided yet (choices stay hidden). Empty when no timer is running.
+   */
+  acting?: number[];
+  /** true on snapshots of a hand that was just redealt because everyone passed */
+  redealt?: boolean;
   /** last 50 chat entries */
   chat: ChatEntry[];
 }
