@@ -255,6 +255,9 @@ export const useStore = create<StoreState>((set, get) => ({
           lastError: error,
           roomNotFound: message.code === 'room_not_found' ? true : state.roomNotFound,
           joinError: joining && message.code !== 'room_not_found' ? error : state.joinError,
+          // A refused create_room (server full, too many creates) answers with an error: stop
+          // waiting for a room so the Create button comes back at once.
+          creating: state.creating !== null && state.creating.answered ? null : state.creating,
         });
         return;
       }

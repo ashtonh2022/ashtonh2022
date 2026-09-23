@@ -135,4 +135,19 @@ describe('Home', () => {
     receive({ type: 'room_state', room: roomView(null, { code: 'NEWNEW' }) });
     expect(screen.getByTestId('where')).toHaveTextContent('/room/NEWNEW');
   });
+
+  it('brings the Create button back as soon as the server refuses the room', () => {
+    renderWithRoutes();
+    fireEvent.click(screen.getByRole('button', { name: 'Create room' }));
+    receive({ type: 'welcome', playerId: 'p0', token: 't', name: 'Ada', protocol: 1 });
+    receive({ type: 'pong' });
+    expect(screen.getByRole('button', { name: 'Creating room...' })).toBeDisabled();
+    receive({
+      type: 'error',
+      code: 'rate_limited',
+      message: 'The server is full right now. Try again later.',
+    });
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeEnabled();
+    expect(screen.queryByTestId('where')).toBeNull();
+  });
 });
